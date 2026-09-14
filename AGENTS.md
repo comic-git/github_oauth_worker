@@ -8,7 +8,7 @@
 
 ## Project Overview
 
-oauth_worker is a self-hostable OAuth bridge for comic_git Decap CMS sites. It authenticates editors through a GitHub App, applies an optional GitHub-login allowlist, and returns the short-lived user token that Decap uses to edit the configured repository.
+github_oauth_worker is a self-hostable OAuth bridge for comic_git Decap CMS sites. It authenticates editors through a GitHub App, applies an optional GitHub-login whitelist, and returns the short-lived user token that Decap uses to edit the configured repository.
 
 ## Behavioral Guardrails
 

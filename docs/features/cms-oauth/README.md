@@ -8,7 +8,7 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 
 - Give Decap editors a GitHub App user token with only the App's installed repositories and granted permissions.
 - Make shared hosting and independent self-hosting practical without source changes.
-- Start with a simple GitHub-login allowlist that can later support a paid-access policy.
+- Default to a GitHub-login whitelist for self-hosted workers, with a policy seam that can later support paid access.
 - Keep the public service stateless, inexpensive, and safe to operate at low traffic.
 
 ## Non-Goals

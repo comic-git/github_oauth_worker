@@ -5,9 +5,9 @@
 
 ## Overview
 
-oauth_worker is a self-hostable OAuth bridge for comic_git Decap CMS sites. It issues GitHub App user tokens only after it verifies a binding between the browser's actual CMS origin and one repository selected during GitHub App installation.
+github_oauth_worker is a self-hostable OAuth bridge for comic_git Decap CMS sites. It issues GitHub App user tokens only after it verifies a binding between the browser's actual CMS origin and one repository selected during GitHub App installation.
 
-The shared service can accept self-service enrollment for any eligible comic_git owner. Independently hosted services default to a GitHub-login allowlist. Both modes use the same binding and repository-verification controls, so `public` policy never means that an arbitrary browser origin can receive an editor token.
+The comic_git-operated shared service can accept self-service enrollment for eligible comic_git owners. Independently hosted services default to a GitHub-login whitelist and must not use `public` mode. Both modes use the same binding and repository-verification controls, so `public` policy never means that an arbitrary browser origin can receive an editor token.
 
 ## Components
 
@@ -43,6 +43,7 @@ The endpoint and security contract is in [CMS OAuth worker contract](features/cm
 ## Design Constraints
 
 - The worker must be publicly reachable for browser popups, but only registered exact origins receive callback tokens.
+- Test and production are separate Cloud Run workers, GitHub Apps, service accounts, credentials, and Firestore databases in one GCP project. Database-specific IAM conditions prevent either worker from accessing the other's records.
 - The worker uses the GitHub App client ID and client secret for user authorization. It does not hold an App private key or issue installation access tokens in the MVP.
 - Firestore stores binding metadata, not GitHub credentials or user sessions.
 - The normal authentication hot path is a direct origin-record lookup, not a collection query.

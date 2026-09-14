@@ -27,7 +27,7 @@ The normal suite must not contact GitHub, Cloud Run, Secret Manager, or a real r
 
 - Reject unsupported providers, invalid `site_id` values, missing state, expired state, and state/cookie mismatches.
 - Verify authorization-code and refresh exchanges use bounded HTTP requests and that sensitive values never appear in errors or logs.
-- Verify allowlist matching is case-insensitive, empty allowlists deny access, and policy runs at enrollment, authorization, and token refresh.
+- Verify whitelist matching is case-insensitive, empty whitelists deny access, and policy runs at enrollment, authorization, and token refresh.
 - Verify Firestore binding lookup, setup installation-ID verification, repository-access verification, origin migration, and lost-origin recovery with simulated boundaries.
 - Verify success and failure callback pages emit Decap-compatible `postMessage` payloads to an exact bound origin, never a wildcard target.
 - Verify the health endpoint exposes no secret configuration.

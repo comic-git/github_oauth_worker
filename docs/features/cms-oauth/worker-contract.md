@@ -28,7 +28,9 @@ Normal domain migration starts from an existing active origin, creates a short-l
 
 ## Access Policy
 
-`ACCESS_POLICY=github_login_allowlist` is the default. `ALLOWED_GITHUB_LOGINS` is a deployer-controlled case-insensitive list; an empty list denies all users. `ACCESS_POLICY=public` is an explicit shared-service option that allows any otherwise eligible GitHub login to enroll.
+`ACCESS_POLICY=github_login_whitelist` is the default. `GITHUB_LOGIN_WHITELIST` is a deployer-controlled case-insensitive list; an empty list denies all users. For third-party deployments, this is the only supported policy mode. Do not set `ACCESS_POLICY=public` on a third-party worker.
+
+`ACCESS_POLICY=public` exists only for the comic_git-operated shared service, where self-service enrollment is part of the product. It still requires a verified repository/origin binding and does not let arbitrary browser origins receive tokens.
 
 Policy is evaluated during enrollment, normal authorization, and refresh. Removing a login prevents new enrollment and subsequent token refresh, but cannot instantly revoke a previously issued GitHub token; expiring user tokens keep that remaining exposure bounded.
 
