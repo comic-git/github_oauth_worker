@@ -1,0 +1,15 @@
+"""Client-safe errors shared by future OAuth and enrollment routes."""
+
+
+class WorkerError(Exception):
+    """An expected failure that has an intentionally generic browser-safe response."""
+
+    status_code = 400
+    public_message = "The request could not be completed."
+
+
+class WorkerUnavailableError(WorkerError):
+    """Report an unavailable worker without revealing deployment configuration."""
+
+    status_code = 503
+    public_message = "The OAuth worker is not configured."

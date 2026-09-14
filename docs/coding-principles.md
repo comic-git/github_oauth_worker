@@ -1,4 +1,4 @@
-<!-- ai-agent-toolkit:managed version="1.3.0" -->
+<!-- ai-agent-toolkit:managed version="1.2.0" -->
 <!-- Audience: AI agents writing code, and developers doing code review. -->
 
 # Coding Principles

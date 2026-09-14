@@ -1,0 +1,9 @@
+# Repository test and static-check runners. These execute only this repository's code.
+prefix_rule(
+    pattern = [".\\.venv\\Scripts\\python.exe", "-m", "pytest"],
+    decision = "allow",
+)
+prefix_rule(
+    pattern = [".\\.venv\\Scripts\\python.exe", "-m", "ruff", "check"],
+    decision = "allow",
+)

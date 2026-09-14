@@ -7,7 +7,22 @@ This repository will provide the OAuth bridge for the Decap CMS integration in c
 
 ## Quick Start
 
-The service has not been bootstrapped yet. The approved implementation design and ordered work are in the ignored local planning files `specs/plan.md` and `specs/tasks.md`.
+The local bootstrap service exposes a health endpoint only. Configuration, signed state, and access-policy foundations are implemented, but OAuth routes remain unavailable until the binding and GitHub-client tasks are complete.
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m uvicorn github_oauth_worker.app:app --reload
+```
+
+The health endpoint is available at `http://127.0.0.1:8000/health`.
+
+Copy `.env.example` to an untracked `.env` before later configuration work adds operational settings.
+
+Self-hosted deployments must keep the default `ACCESS_POLICY=github_login_whitelist` and define `GITHUB_LOGIN_WHITELIST`. The `public` policy exists only for the comic_git-operated shared worker.
 
 See [`docs/dev_setup.md`](docs/dev_setup.md) for planned prerequisites and the local-development boundary.
 

@@ -1,11 +1,19 @@
-<!-- ai-agent-toolkit:managed version="1.1.0" -->
+<!-- ai-agent-toolkit:managed version="1.0.0" -->
 <!-- Audience: New developers and AI agents that need to run the project locally. -->
 
 # Dev Setup
 
 ## Current State
 
-The application scaffold does not exist yet, so there is no runnable local command. The implementation will add the exact venv commands, locked dependency installation, and `.env.example`; do not infer an application package or secrets from this document before that work is complete.
+The package, local venv workflow, bootstrap health endpoint, configuration validation, signed OAuth-state utilities, and GitHub-login access-policy boundary are implemented. OAuth, binding, and GitHub API routes are still in development, so local startup intentionally remains in bootstrap mode unless ready-mode configuration is supplied.
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m uvicorn github_oauth_worker.app:app --reload
+```
 
 ## Planned Prerequisites
 
@@ -23,6 +31,8 @@ The test and production workers have different public URLs, GitHub Apps, client 
 ## Credentials
 
 Local credentials belong in an untracked `.env` file. GitHub App client secrets, state-signing secrets, access tokens, refresh tokens, and authorization codes must never be checked in, pasted into test snapshots, or placed in logs.
+
+Self-hosted deployments must use the default `ACCESS_POLICY=github_login_whitelist` and configure `GITHUB_LOGIN_WHITELIST`. The `public` policy is reserved for the comic_git-operated shared service.
 
 ## Common Setup Issue
 

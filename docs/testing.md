@@ -5,7 +5,14 @@
 
 ## Current State
 
-No test suite exists until the application scaffold is added. The first implementation must add executable commands here rather than leaving them as placeholders.
+Run the normal offline suite and static checks from the local venv:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check .
+```
+
+The bootstrap test verifies the health endpoint and confirms OAuth routes are unavailable before configuration exists.
 
 ## Test Structure
 
