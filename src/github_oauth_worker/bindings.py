@@ -3,7 +3,7 @@
 import asyncio
 import hashlib
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
 
@@ -93,6 +93,7 @@ class OriginRecord(BaseModel):
 
     origin: str
     added_at: datetime
+    grace_period_ends_at: datetime | None = None
 
     @model_validator(mode="after")
     def validate_origin_and_timestamp(self) -> OriginRecord:
@@ -100,8 +101,40 @@ class OriginRecord(BaseModel):
         canonical_origin = canonicalize_origin(self.origin)
         if canonical_origin != self.origin:
             raise ValueError("Origin records must use a canonical origin.")
-        if self.added_at.tzinfo is None:
+        if self.added_at.tzinfo is None or (
+            self.grace_period_ends_at is not None
+            and self.grace_period_ends_at.tzinfo is None
+        ):
             raise ValueError("Origin audit timestamps must include a timezone.")
+        if self.grace_period_ends_at is not None and self.grace_period_ends_at <= self.added_at:
+            raise ValueError("An origin grace period must end after the origin was added.")
+        return self
+
+
+class PendingOriginRecord(BaseModel):
+    """A destination origin that cannot authorize until its own browser proves control."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    origin: str
+    repository_id: int = Field(gt=0)
+    source_origin: str
+    created_at: datetime
+    expires_at: datetime
+
+    @model_validator(mode="after")
+    def validate_pending_origin(self) -> PendingOriginRecord:
+        """Keep a pending migration unambiguous, bounded, and independent of browser state."""
+        if canonicalize_origin(self.origin) != self.origin:
+            raise ValueError("Pending origins must use a canonical origin.")
+        if canonicalize_origin(self.source_origin) != self.source_origin:
+            raise ValueError("Pending source origins must use a canonical origin.")
+        if self.origin == self.source_origin:
+            raise ValueError("A pending origin must differ from its source origin.")
+        if self.created_at.tzinfo is None or self.expires_at.tzinfo is None:
+            raise ValueError("Pending-origin timestamps must include a timezone.")
+        if self.expires_at <= self.created_at:
+            raise ValueError("A pending origin must expire after it is created.")
         return self
 
 
@@ -190,6 +223,28 @@ class BindingStore(Protocol):
     async def remove_origin(self, repository_id: int, origin: str) -> RepositoryBinding:
         """Atomically remove a non-final origin from an existing binding."""
 
+    async def begin_origin_migration(
+        self,
+        repository_id: int,
+        source_origin: str,
+        target_origin: str,
+        expires_at: datetime,
+    ) -> PendingOriginRecord:
+        """Record a verified-origin request before the destination origin can authorize."""
+
+    async def complete_origin_migration(
+        self,
+        target_origin: str,
+        grace_period: timedelta,
+    ) -> RepositoryBinding:
+        """Activate an exact pending destination and begin the source-origin grace period."""
+
+    async def mark_recovery_required(self, repository_id: int) -> RepositoryBinding:
+        """Disable authorization until a fresh App installation confirmation repairs a binding."""
+
+    async def recover_binding(self, binding: RepositoryBinding) -> RepositoryBinding:
+        """Restore an existing repository binding with freshly verified App metadata and origin."""
+
     async def refresh_repository_metadata(
         self,
         repository_id: int,
@@ -206,6 +261,7 @@ class InMemoryBindingStore(BindingStore):
     def __init__(self, now: Callable[[], datetime] | None = None) -> None:
         self._bindings: dict[int, RepositoryBinding] = {}
         self._origin_repository_ids: dict[str, int] = {}
+        self._pending_origins: dict[str, PendingOriginRecord] = {}
         self._lock = asyncio.Lock()
         self._now = now or (lambda: datetime.now(UTC))
 
@@ -230,7 +286,25 @@ class InMemoryBindingStore(BindingStore):
         canonical_origin = canonicalize_origin(origin)
         async with self._lock:
             repository_id = self._origin_repository_ids.get(canonical_origin)
-            return self._bindings.get(repository_id) if repository_id is not None else None
+            binding = self._bindings.get(repository_id) if repository_id is not None else None
+            if binding is None:
+                return None
+            origin_record = _find_origin_record(binding, canonical_origin)
+            if origin_record is None or not _origin_is_active(origin_record, self._now()):
+                if origin_record is not None and len(binding.origins) > 1:
+                    self._bindings[binding.repository_id] = binding.model_copy(
+                        update={
+                            "origins": tuple(
+                                record
+                                for record in binding.origins
+                                if record.origin != canonical_origin
+                            ),
+                            "updated_at": self._now(),
+                        }
+                    )
+                    del self._origin_repository_ids[canonical_origin]
+                return None
+            return binding
 
     async def add_origin(self, repository_id: int, origin: str) -> RepositoryBinding:
         """Create an origin record only when it is not claimed by another repository."""
@@ -280,6 +354,122 @@ class InMemoryBindingStore(BindingStore):
             del self._origin_repository_ids[canonical_origin]
             return updated_binding
 
+    async def begin_origin_migration(
+        self,
+        repository_id: int,
+        source_origin: str,
+        target_origin: str,
+        expires_at: datetime,
+    ) -> PendingOriginRecord:
+        """Persist a target-origin claim only after checking the active source binding."""
+        canonical_source = canonicalize_origin(source_origin)
+        canonical_target = canonicalize_origin(target_origin)
+        async with self._lock:
+            binding = self._require_binding(repository_id)
+            source_record = _find_origin_record(binding, canonical_source)
+            if (
+                binding.status is not BindingStatus.ACTIVE
+                or source_record is None
+                or not _origin_is_active(source_record, self._now())
+            ):
+                raise BindingNotFoundError
+            if (
+                canonical_target in self._origin_repository_ids
+                or canonical_target in self._pending_origins
+            ):
+                raise BindingConflictError
+            pending = PendingOriginRecord(
+                origin=canonical_target,
+                repository_id=repository_id,
+                source_origin=canonical_source,
+                created_at=self._now(),
+                expires_at=expires_at,
+            )
+            self._pending_origins[canonical_target] = pending
+            return pending
+
+    async def complete_origin_migration(
+        self,
+        target_origin: str,
+        grace_period: timedelta,
+    ) -> RepositoryBinding:
+        """Activate only the exact pending target and make its source temporarily dual-homed."""
+        canonical_target = canonicalize_origin(target_origin)
+        if grace_period <= timedelta(0):
+            raise ValueError("Origin migration grace period must be positive.")
+        async with self._lock:
+            pending = self._pending_origins.get(canonical_target)
+            if pending is None:
+                raise BindingNotFoundError
+            timestamp = self._now()
+            if pending.expires_at <= timestamp:
+                del self._pending_origins[canonical_target]
+                raise BindingNotFoundError
+            binding = self._require_binding(pending.repository_id)
+            source_record = _find_origin_record(binding, pending.source_origin)
+            if (
+                binding.status is not BindingStatus.ACTIVE
+                or source_record is None
+                or not _origin_is_active(source_record, timestamp)
+                or canonical_target in self._origin_repository_ids
+            ):
+                raise BindingConflictError
+            updated_source = source_record.model_copy(
+                update={"grace_period_ends_at": timestamp + grace_period}
+            )
+            updated_binding = binding.model_copy(
+                update={
+                    "origins": tuple(
+                        updated_source if record.origin == pending.source_origin else record
+                        for record in binding.origins
+                    )
+                    + (OriginRecord(origin=canonical_target, added_at=timestamp),),
+                    "updated_at": timestamp,
+                }
+            )
+            self._bindings[binding.repository_id] = updated_binding
+            self._origin_repository_ids[canonical_target] = binding.repository_id
+            del self._pending_origins[canonical_target]
+            return updated_binding
+
+    async def mark_recovery_required(self, repository_id: int) -> RepositoryBinding:
+        """Make a stale App installation unusable until its owner completes recovery."""
+        async with self._lock:
+            binding = self._require_binding(repository_id)
+            if binding.status is BindingStatus.RECOVERY_REQUIRED:
+                return binding
+            updated_binding = binding.model_copy(
+                update={"status": BindingStatus.RECOVERY_REQUIRED, "updated_at": self._now()}
+            )
+            self._bindings[repository_id] = updated_binding
+            return updated_binding
+
+    async def recover_binding(self, binding: RepositoryBinding) -> RepositoryBinding:
+        """Refresh a recoverable repository while atomically claiming its new CMS origin."""
+        async with self._lock:
+            existing = self._require_binding(binding.repository_id)
+            canonical_origin = binding.origins[0].origin
+            claimed_by = self._origin_repository_ids.get(canonical_origin)
+            if claimed_by is not None and claimed_by != binding.repository_id:
+                raise BindingConflictError
+            origins = existing.origins
+            if _find_origin_record(existing, canonical_origin) is None:
+                origins = (*origins, binding.origins[0])
+                self._origin_repository_ids[canonical_origin] = binding.repository_id
+            updated_binding = existing.model_copy(
+                update={
+                    "repository_owner": binding.repository_owner,
+                    "repository_name": binding.repository_name,
+                    "installation_id": binding.installation_id,
+                    "status": BindingStatus.ACTIVE,
+                    "origins": origins,
+                    "updated_at": self._now(),
+                    "last_verified_at": self._now(),
+                }
+            )
+            self._bindings[binding.repository_id] = updated_binding
+            return updated_binding
+
     async def refresh_repository_metadata(
         self,
         repository_id: int,
@@ -316,6 +506,7 @@ class FirestoreBindingStore(BindingStore):
 
     _BINDINGS_COLLECTION = "bindings"
     _ORIGINS_COLLECTION = "origins"
+    _PENDING_ORIGINS_COLLECTION = "pending_origins"
 
     def __init__(self, client: AsyncClient, now: Callable[[], datetime] | None = None) -> None:
         self._client = client
@@ -369,7 +560,15 @@ class FirestoreBindingStore(BindingStore):
         lookup = self._origin_lookup_from_snapshot(origin_snapshot)
         if lookup.origin != canonical_origin:
             raise BindingStoreError
-        return await self.get_binding(lookup.repository_id)
+        binding = await self.get_binding(lookup.repository_id)
+        if binding is None:
+            return None
+        origin_record = _find_origin_record(binding, canonical_origin)
+        if origin_record is None or not _origin_is_active(origin_record, self._now()):
+            if origin_record is not None:
+                await self._remove_expired_origin(lookup.repository_id, canonical_origin)
+            return None
+        return binding
 
     async def add_origin(self, repository_id: int, origin: str) -> RepositoryBinding:
         """Atomically claim a free origin and add it to its repository binding document."""
@@ -430,6 +629,199 @@ class FirestoreBindingStore(BindingStore):
 
         return await write(self._client.transaction())
 
+    async def begin_origin_migration(
+        self,
+        repository_id: int,
+        source_origin: str,
+        target_origin: str,
+        expires_at: datetime,
+    ) -> PendingOriginRecord:
+        """Create a direct pending-target record after proving the source is currently active."""
+        canonical_source = canonicalize_origin(source_origin)
+        canonical_target = canonicalize_origin(target_origin)
+        binding_reference = self._binding_reference(repository_id)
+        target_reference = self._pending_origin_reference(canonical_target)
+        active_target_reference = self._origin_reference(canonical_target)
+
+        @async_transactional
+        async def write(transaction: object) -> PendingOriginRecord:
+            binding_snapshot = await binding_reference.get(transaction=transaction)
+            if not binding_snapshot.exists:
+                raise BindingNotFoundError
+            binding = self._binding_from_snapshot(binding_snapshot)
+            source_record = _find_origin_record(binding, canonical_source)
+            if (
+                binding.status is not BindingStatus.ACTIVE
+                or source_record is None
+                or not _origin_is_active(source_record, self._now())
+            ):
+                raise BindingNotFoundError
+            if (
+                (await target_reference.get(transaction=transaction)).exists
+                or (await active_target_reference.get(transaction=transaction)).exists
+            ):
+                raise BindingConflictError
+            pending = PendingOriginRecord(
+                origin=canonical_target,
+                repository_id=repository_id,
+                source_origin=canonical_source,
+                created_at=self._now(),
+                expires_at=expires_at,
+            )
+            transaction.create(target_reference, self._pending_origin_document(pending))
+            return pending
+
+        return await write(self._client.transaction())
+
+    async def complete_origin_migration(
+        self,
+        target_origin: str,
+        grace_period: timedelta,
+    ) -> RepositoryBinding:
+        """Turn a matching pending target into an active origin in one paired transaction."""
+        canonical_target = canonicalize_origin(target_origin)
+        if grace_period <= timedelta(0):
+            raise ValueError("Origin migration grace period must be positive.")
+        pending_reference = self._pending_origin_reference(canonical_target)
+        target_reference = self._origin_reference(canonical_target)
+
+        @async_transactional
+        async def write(transaction: object) -> RepositoryBinding:
+            pending_snapshot = await pending_reference.get(transaction=transaction)
+            if not pending_snapshot.exists:
+                raise BindingNotFoundError
+            pending = self._pending_origin_from_snapshot(pending_snapshot)
+            timestamp = self._now()
+            if pending.expires_at <= timestamp:
+                transaction.delete(pending_reference)
+                raise BindingNotFoundError
+            binding_reference = self._binding_reference(pending.repository_id)
+            binding_snapshot = await binding_reference.get(transaction=transaction)
+            if not binding_snapshot.exists:
+                raise BindingNotFoundError
+            binding = self._binding_from_snapshot(binding_snapshot)
+            source_record = _find_origin_record(binding, pending.source_origin)
+            if (
+                binding.status is not BindingStatus.ACTIVE
+                or source_record is None
+                or not _origin_is_active(source_record, timestamp)
+                or (await target_reference.get(transaction=transaction)).exists
+            ):
+                raise BindingConflictError
+            updated_source = source_record.model_copy(
+                update={"grace_period_ends_at": timestamp + grace_period}
+            )
+            updated_binding = binding.model_copy(
+                update={
+                    "origins": tuple(
+                        updated_source if record.origin == pending.source_origin else record
+                        for record in binding.origins
+                    )
+                    + (OriginRecord(origin=canonical_target, added_at=timestamp),),
+                    "updated_at": timestamp,
+                }
+            )
+            transaction.set(binding_reference, self._binding_document(updated_binding))
+            transaction.create(
+                target_reference,
+                self._origin_document(
+                    OriginLookupRecord(origin=canonical_target, repository_id=binding.repository_id)
+                ),
+            )
+            transaction.delete(pending_reference)
+            return updated_binding
+
+        return await write(self._client.transaction())
+
+    async def mark_recovery_required(self, repository_id: int) -> RepositoryBinding:
+        """Persist a fail-closed status after GitHub no longer verifies the selected repository."""
+        binding_reference = self._binding_reference(repository_id)
+
+        @async_transactional
+        async def write(transaction: object) -> RepositoryBinding:
+            binding_snapshot = await binding_reference.get(transaction=transaction)
+            if not binding_snapshot.exists:
+                raise BindingNotFoundError
+            binding = self._binding_from_snapshot(binding_snapshot)
+            if binding.status is BindingStatus.RECOVERY_REQUIRED:
+                return binding
+            updated_binding = binding.model_copy(
+                update={"status": BindingStatus.RECOVERY_REQUIRED, "updated_at": self._now()}
+            )
+            transaction.set(binding_reference, self._binding_document(updated_binding))
+            return updated_binding
+
+        return await write(self._client.transaction())
+
+    async def recover_binding(self, binding: RepositoryBinding) -> RepositoryBinding:
+        """Restore a repository from a verified setup flow while retaining its known origins."""
+        binding_reference = self._binding_reference(binding.repository_id)
+        new_origin = binding.origins[0].origin
+        origin_reference = self._origin_reference(new_origin)
+
+        @async_transactional
+        async def write(transaction: object) -> RepositoryBinding:
+            binding_snapshot = await binding_reference.get(transaction=transaction)
+            if not binding_snapshot.exists:
+                raise BindingNotFoundError
+            existing = self._binding_from_snapshot(binding_snapshot)
+            origin_snapshot = await origin_reference.get(transaction=transaction)
+            if origin_snapshot.exists:
+                lookup = self._origin_lookup_from_snapshot(origin_snapshot)
+                if lookup.repository_id != binding.repository_id:
+                    raise BindingConflictError
+            origins = existing.origins
+            if _find_origin_record(existing, new_origin) is None:
+                origins = (*origins, binding.origins[0])
+                transaction.create(
+                    origin_reference,
+                    self._origin_document(
+                        OriginLookupRecord(origin=new_origin, repository_id=binding.repository_id)
+                    ),
+                )
+            timestamp = self._now()
+            updated_binding = existing.model_copy(
+                update={
+                    "repository_owner": binding.repository_owner,
+                    "repository_name": binding.repository_name,
+                    "installation_id": binding.installation_id,
+                    "status": BindingStatus.ACTIVE,
+                    "origins": origins,
+                    "updated_at": timestamp,
+                    "last_verified_at": timestamp,
+                }
+            )
+            transaction.set(binding_reference, self._binding_document(updated_binding))
+            return updated_binding
+
+        return await write(self._client.transaction())
+
+    async def _remove_expired_origin(self, repository_id: int, origin: str) -> None:
+        """Lazily remove a completed migration's source index after its grace period ends."""
+        binding_reference = self._binding_reference(repository_id)
+        origin_reference = self._origin_reference(origin)
+
+        @async_transactional
+        async def write(transaction: object) -> None:
+            binding_snapshot = await binding_reference.get(transaction=transaction)
+            if not binding_snapshot.exists:
+                return
+            binding = self._binding_from_snapshot(binding_snapshot)
+            record = _find_origin_record(binding, origin)
+            if (
+                record is None
+                or _origin_is_active(record, self._now())
+                or len(binding.origins) == 1
+            ):
+                return
+            transaction.set(
+                binding_reference,
+                self._binding_document(self._binding_with_removed_origin(binding, origin)),
+            )
+            transaction.delete(origin_reference)
+
+        await write(self._client.transaction())
+
     async def refresh_repository_metadata(
         self,
         repository_id: int,
@@ -471,6 +863,12 @@ class FirestoreBindingStore(BindingStore):
             origin_document_id(origin)
         )
 
+    def _pending_origin_reference(self, origin: str) -> object:
+        """Use a separate direct index so an unverified target cannot authorize prematurely."""
+        return self._client.collection(self._PENDING_ORIGINS_COLLECTION).document(
+            origin_document_id(origin)
+        )
+
     @staticmethod
     def _binding_document(binding: RepositoryBinding) -> dict[str, object]:
         """Serialize validated data using Firestore's native timestamp support."""
@@ -480,6 +878,11 @@ class FirestoreBindingStore(BindingStore):
     def _origin_document(lookup: OriginLookupRecord) -> dict[str, object]:
         """Serialize the minimal non-secret direct-origin lookup record."""
         return lookup.model_dump(mode="python")
+
+    @staticmethod
+    def _pending_origin_document(pending: PendingOriginRecord) -> dict[str, object]:
+        """Serialize the short-lived migration record without browser state or credentials."""
+        return pending.model_dump(mode="python")
 
     @staticmethod
     def _binding_from_snapshot(snapshot: object) -> RepositoryBinding:
@@ -494,6 +897,14 @@ class FirestoreBindingStore(BindingStore):
         """Validate Firestore index data before using its repository identifier."""
         try:
             return OriginLookupRecord.model_validate(snapshot.to_dict())
+        except (AttributeError, ValidationError):
+            raise BindingStoreError from None
+
+    @staticmethod
+    def _pending_origin_from_snapshot(snapshot: object) -> PendingOriginRecord:
+        """Validate pending-origin data before it determines an activation target."""
+        try:
+            return PendingOriginRecord.model_validate(snapshot.to_dict())
         except (AttributeError, ValidationError):
             raise BindingStoreError from None
 
@@ -528,3 +939,13 @@ class FirestoreBindingStore(BindingStore):
                 "updated_at": self._now(),
             }
         )
+
+
+def _find_origin_record(binding: RepositoryBinding, origin: str) -> OriginRecord | None:
+    """Return one canonical origin record without accidentally accepting an index-only entry."""
+    return next((record for record in binding.origins if record.origin == origin), None)
+
+
+def _origin_is_active(record: OriginRecord, now: datetime) -> bool:
+    """Treat a completed migration's source origin as inactive once its grace period expires."""
+    return record.grace_period_ends_at is None or now < record.grace_period_ends_at

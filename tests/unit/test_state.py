@@ -105,4 +105,9 @@ def _issue_state(state_manager: OAuthStateManager, flow: OAuthFlow):
         return state_manager.issue_enrollment("https://cms.example.com")
     if flow is OAuthFlow.SETUP:
         return state_manager.issue_setup("https://cms.example.com", 123, 456)
-    return state_manager.issue(flow)
+    return state_manager.issue_origin_migration(
+        "https://cms.example.com",
+        "https://new-cms.example.com",
+        123,
+        456,
+    )

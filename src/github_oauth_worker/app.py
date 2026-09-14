@@ -1,5 +1,6 @@
 """FastAPI application composition for the GitHub OAuth worker."""
 
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlencode
 
 from fastapi import FastAPI, Request, Response
@@ -18,12 +19,15 @@ from github_oauth_worker.decap_protocol import (
     DecapTokenPayload,
     render_error_callback_page,
     render_handshake_page,
+    render_management_result_page,
+    render_origin_completion_handshake_page,
+    render_origin_migration_handshake_page,
     render_setup_handshake_page,
     render_success_callback_page,
 )
 from github_oauth_worker.enrollment import render_enrollment_confirmation_page
 from github_oauth_worker.errors import WorkerError
-from github_oauth_worker.github_client import GitHubAppClient
+from github_oauth_worker.github_client import GitHubAccessVerificationError, GitHubAppClient
 from github_oauth_worker.policy import AccessOperation, build_access_policy
 from github_oauth_worker.state import IssuedOAuthState, OAuthFlow, OAuthState, OAuthStateManager
 
@@ -60,6 +64,15 @@ class SetupHandshakeRequest(BaseModel):
 
     origin: str
     installation_id: int
+
+
+class OriginMigrationHandshakeRequest(BaseModel):
+    """A current browser origin and desired destination captured by the migration popup."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    origin: str
+    target_origin: str
 
 
 def create_app(
@@ -140,6 +153,51 @@ def create_app(
             )
             return redirect_to_github(issued_state)
 
+        @app.get("/origins/migrate")
+        def origin_migration(target_origin: str) -> HTMLResponse:
+            """Open an existing CMS site's migration popup without trusting its query origin."""
+            try:
+                return HTMLResponse(render_origin_migration_handshake_page(target_origin))
+            except ValueError:
+                raise WorkerError from None
+
+        @app.post("/origins/migrate/handshake")
+        async def origin_migration_handshake(
+            handshake: OriginMigrationHandshakeRequest,
+        ) -> RedirectResponse:
+            """Authorize a migration only after the source origin resolves to an active binding."""
+            binding = await app.state.binding_store.get_binding_for_origin(handshake.origin)
+            if binding is None or binding.status is not BindingStatus.ACTIVE:
+                raise WorkerError
+            try:
+                source_origin = canonicalize_origin(handshake.origin)
+                target_origin = canonicalize_origin(handshake.target_origin)
+            except ValueError:
+                raise WorkerError from None
+            issued_state = app.state.state_manager.issue_origin_migration(
+                source_origin,
+                target_origin,
+                binding.repository_id,
+                binding.installation_id,
+            )
+            return redirect_to_github(issued_state, binding.repository_id)
+
+        @app.get("/origins/complete")
+        def complete_origin_migration() -> HTMLResponse:
+            """Open a destination CMS popup that captures its actual origin before completion."""
+            return HTMLResponse(render_origin_completion_handshake_page())
+
+        @app.post("/origins/complete/handshake")
+        async def complete_origin_migration_handshake(
+            handshake: AuthHandshakeRequest,
+        ) -> HTMLResponse:
+            """Activate only a non-expired pending origin whose exact opener origin matches it."""
+            await app.state.binding_store.complete_origin_migration(
+                handshake.origin,
+                timedelta(seconds=worker_settings.origin_grace_period_seconds),
+            )
+            return HTMLResponse(render_management_result_page("CMS origin migration is complete."))
+
         @app.post("/auth/handshake")
         async def auth_handshake(handshake: AuthHandshakeRequest) -> RedirectResponse:
             """Resolve a bound opener origin, then redirect its binding to GitHub authorization."""
@@ -182,14 +240,17 @@ def create_app(
                             state,
                         )
                     return await setup_callback(oauth_state.origin, oauth_state, code)
+                if oauth_state.flow is OAuthFlow.ORIGIN_MIGRATION:
+                    return await origin_migration_callback(oauth_state, code)
                 if oauth_state.flow is not OAuthFlow.DECAP:
                     raise WorkerError
                 assert oauth_state.repository_id is not None
                 assert oauth_state.installation_id is not None
-                binding = await app.state.binding_store.get_binding(oauth_state.repository_id)
+                binding = await app.state.binding_store.get_binding_for_origin(oauth_state.origin)
                 if (
                     binding is None
                     or binding.status is not BindingStatus.ACTIVE
+                    or binding.repository_id != oauth_state.repository_id
                     or binding.installation_id != oauth_state.installation_id
                     or oauth_state.origin not in {record.origin for record in binding.origins}
                 ):
@@ -206,11 +267,15 @@ def create_app(
                     github_user.login,
                     AccessOperation.AUTHORIZATION,
                 )
-                repository = await app.state.github_client.verify_bound_repository_access(
-                    access_token.access_token,
-                    binding.installation_id,
-                    binding.repository_id,
-                )
+                try:
+                    repository = await app.state.github_client.verify_bound_repository_access(
+                        access_token.access_token,
+                        binding.installation_id,
+                        binding.repository_id,
+                    )
+                except GitHubAccessVerificationError:
+                    await app.state.binding_store.mark_recovery_required(binding.repository_id)
+                    raise
                 await app.state.binding_store.refresh_repository_metadata(
                     binding.repository_id,
                     repository.owner.login,
@@ -229,6 +294,11 @@ def create_app(
                     )
                 )
             except WorkerError as error:
+                if oauth_state.flow is OAuthFlow.ORIGIN_MIGRATION:
+                    return HTMLResponse(
+                        render_management_result_page(error.public_message),
+                        status_code=error.status_code,
+                    )
                 return HTMLResponse(
                     render_error_callback_page(oauth_state.origin, error.public_message),
                     status_code=error.status_code,
@@ -288,15 +358,18 @@ def create_app(
                 oauth_state.installation_id,
                 oauth_state.repository_id,
             )
-            await app.state.binding_store.create_binding(
-                RepositoryBinding.create(
-                    repository_id=repository.id,
-                    repository_owner=repository.owner.login,
-                    repository_name=repository.name,
-                    installation_id=oauth_state.installation_id,
-                    origin=origin,
-                )
+            recovered_binding = RepositoryBinding.create(
+                repository_id=repository.id,
+                repository_owner=repository.owner.login,
+                repository_name=repository.name,
+                installation_id=oauth_state.installation_id,
+                origin=origin,
             )
+            existing_binding = await app.state.binding_store.get_binding(repository.id)
+            if existing_binding is None:
+                await app.state.binding_store.create_binding(recovered_binding)
+            else:
+                await app.state.binding_store.recover_binding(recovered_binding)
             return HTMLResponse(
                 render_success_callback_page(
                     origin,
@@ -306,6 +379,53 @@ def create_app(
                         refresh_token=access_token.refresh_token,
                         expires_in=access_token.expires_in,
                     ),
+                )
+            )
+
+        async def origin_migration_callback(
+            oauth_state: OAuthState,
+            code: str,
+        ) -> HTMLResponse:
+            """Create a pending destination only after fresh owner policy and App access checks."""
+            assert oauth_state.origin is not None
+            assert oauth_state.target_origin is not None
+            assert oauth_state.repository_id is not None
+            assert oauth_state.installation_id is not None
+            access_token = await app.state.github_client.exchange_authorization_code(
+                code,
+                oauth_state.repository_id,
+            )
+            github_user = await app.state.github_client.get_authenticated_user(
+                access_token.access_token
+            )
+            build_access_policy(worker_settings).require_permitted(
+                github_user.login,
+                AccessOperation.AUTHORIZATION,
+            )
+            try:
+                repository = await app.state.github_client.verify_bound_repository_access(
+                    access_token.access_token,
+                    oauth_state.installation_id,
+                    oauth_state.repository_id,
+                )
+            except GitHubAccessVerificationError:
+                await app.state.binding_store.mark_recovery_required(oauth_state.repository_id)
+                raise
+            await app.state.binding_store.refresh_repository_metadata(
+                oauth_state.repository_id,
+                repository.owner.login,
+                repository.name,
+                oauth_state.installation_id,
+            )
+            await app.state.binding_store.begin_origin_migration(
+                oauth_state.repository_id,
+                oauth_state.origin,
+                oauth_state.target_origin,
+                datetime.now(UTC) + timedelta(seconds=worker_settings.oauth_state_ttl_seconds),
+            )
+            return HTMLResponse(
+                render_management_result_page(
+                    "CMS origin migration is ready to complete at the destination site."
                 )
             )
 
@@ -416,11 +536,15 @@ def create_app(
                     github_user.login,
                     AccessOperation.REFRESH,
                 )
-                repository = await app.state.github_client.verify_bound_repository_access(
-                    access_token.access_token,
-                    binding.installation_id,
-                    binding.repository_id,
-                )
+                try:
+                    repository = await app.state.github_client.verify_bound_repository_access(
+                        access_token.access_token,
+                        binding.installation_id,
+                        binding.repository_id,
+                    )
+                except GitHubAccessVerificationError:
+                    await app.state.binding_store.mark_recovery_required(binding.repository_id)
+                    raise
                 await app.state.binding_store.refresh_repository_metadata(
                     binding.repository_id,
                     repository.owner.login,

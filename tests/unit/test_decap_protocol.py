@@ -6,6 +6,9 @@ from github_oauth_worker.decap_protocol import (
     DecapTokenPayload,
     render_error_callback_page,
     render_handshake_page,
+    render_management_result_page,
+    render_origin_completion_handshake_page,
+    render_origin_migration_handshake_page,
     render_success_callback_page,
 )
 
@@ -41,5 +44,18 @@ def test_error_callback_keeps_the_exact_origin_and_escapes_script_data() -> None
     page = render_error_callback_page("https://cms.example.com", "<script>unexpected</script>")
 
     assert 'const targetOrigin = "https://cms.example.com"' in page
-    assert "\\u003cscript>unexpected\\u003c/script>" in page
+    assert "\\u003cscript\\u003eunexpected\\u003c/script\\u003e" in page
     assert "authorization:github:error:" in page
+
+
+def test_management_templates_serialize_javascript_values_without_manual_escaping() -> None:
+    migration_page = render_origin_migration_handshake_page("https://new-cms.example.com")
+    completion_page = render_origin_completion_handshake_page()
+    result_page = render_management_result_page("<script>unexpected</script>")
+
+    assert 'const endpoint = "/origins/migrate/handshake"' in migration_page
+    assert 'target_origin: "https://new-cms.example.com"' in migration_page
+    assert 'const endpoint = "/origins/complete/handshake"' in completion_page
+    assert "target_origin:" not in completion_page
+    assert "\\u003cscript\\u003eunexpected\\u003c/script\\u003e" in result_page
+    assert "<script>unexpected</script>" not in result_page

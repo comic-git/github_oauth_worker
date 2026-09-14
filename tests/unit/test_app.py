@@ -7,10 +7,11 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from github_oauth_worker.app import create_app
-from github_oauth_worker.bindings import InMemoryBindingStore, RepositoryBinding
+from github_oauth_worker.bindings import BindingStatus, InMemoryBindingStore, RepositoryBinding
 from github_oauth_worker.config import AccessPolicyMode, ServiceMode, WorkerSettings
 from github_oauth_worker.errors import WorkerUnavailableError
 from github_oauth_worker.github_client import (
+    GitHubAccessVerificationError,
     GitHubRepository,
     GitHubRepositoryOwner,
     GitHubUser,
@@ -224,6 +225,86 @@ def test_app_setup_redirect_requires_fresh_authorization_for_its_same_installati
     assert mismatch.status_code == 400
 
 
+def test_origin_migration_uses_the_exact_destination_handshake_before_activation() -> None:
+    store = InMemoryBindingStore()
+    asyncio.run(
+        store.create_binding(
+            RepositoryBinding.create(
+                repository_id=123,
+                repository_owner="owner",
+                repository_name="comic",
+                installation_id=456,
+                origin="https://old-cms.example.com",
+            )
+        )
+    )
+    client = TestClient(
+        create_app(_ready_settings(), binding_store=store, github_client=_FakeGitHubClient())
+    )
+
+    start = client.post(
+        "/origins/migrate/handshake",
+        json={
+            "origin": "https://old-cms.example.com",
+            "target_origin": "https://new-cms.example.com",
+        },
+        follow_redirects=False,
+    )
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    cookie = start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+
+    prepared = client.get(
+        f"/callback?code=one-time-code&state={state}",
+        headers={"Cookie": f"oauth_correlation_origin_migration={cookie}"},
+    )
+    assert prepared.status_code == 200
+    assert awaitable_result(store.get_binding_for_origin("https://new-cms.example.com")) is None
+
+    complete = client.post(
+        "/origins/complete/handshake",
+        json={"origin": "https://new-cms.example.com"},
+    )
+    assert complete.status_code == 200
+    assert awaitable_result(store.get_binding_for_origin("https://new-cms.example.com")) is not None
+
+
+def test_failed_github_verification_marks_the_binding_for_recovery() -> None:
+    store = InMemoryBindingStore()
+    asyncio.run(
+        store.create_binding(
+            RepositoryBinding.create(
+                repository_id=123,
+                repository_owner="owner",
+                repository_name="comic",
+                installation_id=456,
+                origin="https://cms.example.com",
+            )
+        )
+    )
+    client = TestClient(
+        create_app(
+            _ready_settings(),
+            binding_store=store,
+            github_client=_FakeGitHubClient(fail_repository_verification=True),
+        )
+    )
+
+    start = client.post(
+        "/auth/handshake",
+        json={"origin": "https://cms.example.com"},
+        follow_redirects=False,
+    )
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    cookie = start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+    response = client.get(
+        f"/callback?code=one-time-code&state={state}",
+        headers={"Cookie": f"oauth_correlation_decap={cookie}"},
+    )
+
+    assert response.status_code == 400
+    assert awaitable_result(store.get_binding(123)).status is BindingStatus.RECOVERY_REQUIRED
+
+
 def _ready_settings() -> WorkerSettings:
     return WorkerSettings(
         service_mode=ServiceMode.READY,
@@ -234,6 +315,11 @@ def _ready_settings() -> WorkerSettings:
         state_signing_secret="state-secret",
         access_policy=AccessPolicyMode.PUBLIC,
     )
+
+
+def awaitable_result(awaitable):
+    """Run the small async store assertions without introducing an async HTTP-test framework."""
+    return asyncio.run(awaitable)
 
 
 class _FakeGitHubClient:
@@ -288,12 +374,17 @@ class _FakeGitHubClient:
             ),
         )
 
+    def __init__(self, fail_repository_verification: bool = False) -> None:
+        self._fail_repository_verification = fail_repository_verification
+
     async def verify_bound_repository_access(
         self,
         user_access_token: SecretStr,
         installation_id: int,
         repository_id: int,
     ) -> GitHubRepository:
+        if self._fail_repository_verification:
+            raise GitHubAccessVerificationError
         assert user_access_token.get_secret_value() == "access-token"
         assert installation_id == 456
         assert repository_id == 123

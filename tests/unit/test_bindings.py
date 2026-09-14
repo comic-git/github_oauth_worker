@@ -8,6 +8,7 @@ import pytest
 from github_oauth_worker.bindings import (
     BindingConflictError,
     BindingNotFoundError,
+    BindingStatus,
     CannotRemoveLastOriginError,
     FirestoreBindingStore,
     InMemoryBindingStore,
@@ -128,6 +129,72 @@ def test_in_memory_store_refreshes_only_mutable_github_metadata() -> None:
     asyncio.run(scenario())
 
 
+def test_in_memory_store_activates_only_the_exact_pending_origin_and_expires_the_source() -> None:
+    async def scenario() -> None:
+        timestamp = datetime(2026, 9, 14, tzinfo=UTC)
+        clock = [timestamp]
+        store = InMemoryBindingStore(now=lambda: clock[0])
+        await store.create_binding(
+            _binding(repository_id=101, origin="https://old.example.com", now=timestamp)
+        )
+
+        pending = await store.begin_origin_migration(
+            101,
+            "https://old.example.com",
+            "https://new.example.com",
+            timestamp + timedelta(minutes=10),
+        )
+        assert pending.origin == "https://new.example.com"
+        assert await store.get_binding_for_origin("https://new.example.com") is None
+
+        clock[0] += timedelta(minutes=1)
+        binding = await store.complete_origin_migration(
+            "https://new.example.com",
+            timedelta(hours=1),
+        )
+        source = next(record for record in binding.origins if record.origin == "https://old.example.com")
+        assert source.grace_period_ends_at == clock[0] + timedelta(hours=1)
+        assert await store.get_binding_for_origin("https://old.example.com") is not None
+        assert await store.get_binding_for_origin("https://new.example.com") is not None
+
+        clock[0] += timedelta(hours=1)
+        assert await store.get_binding_for_origin("https://old.example.com") is None
+        assert await store.get_binding_for_origin("https://new.example.com") is not None
+        assert [record.origin for record in (await store.get_binding(101)).origins] == [
+            "https://new.example.com"
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_in_memory_store_marks_and_recovers_a_binding_after_github_access_changes() -> None:
+    async def scenario() -> None:
+        store = InMemoryBindingStore()
+        await store.create_binding(_binding(repository_id=101, origin="https://old.example.com"))
+
+        unavailable = await store.mark_recovery_required(101)
+        assert unavailable.status is BindingStatus.RECOVERY_REQUIRED
+
+        recovered = await store.recover_binding(
+            RepositoryBinding.create(
+                repository_id=101,
+                repository_owner="new-owner",
+                repository_name="new-comic",
+                installation_id=456,
+                origin="https://new.example.com",
+            )
+        )
+        assert recovered.status is BindingStatus.ACTIVE
+        assert recovered.installation_id == 456
+        assert recovered.repository_owner == "new-owner"
+        assert {record.origin for record in recovered.origins} == {
+            "https://old.example.com",
+            "https://new.example.com",
+        }
+
+    asyncio.run(scenario())
+
+
 def test_firestore_store_uses_paired_direct_keys_for_each_atomic_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -153,6 +220,37 @@ def test_firestore_store_uses_paired_direct_keys_for_each_atomic_mutation(
         updated_binding = await store.remove_origin(101, "https://two.example.com")
         assert len(updated_binding.origins) == 1
         assert await store.get_binding_for_origin("https://two.example.com") is None
+
+        await store.begin_origin_migration(
+            101,
+            "https://one.example.com",
+            "https://new.example.com",
+            datetime.now(UTC) + timedelta(minutes=10),
+        )
+        migrated_binding = await store.complete_origin_migration(
+            "https://new.example.com",
+            timedelta(hours=1),
+        )
+        assert {record.origin for record in migrated_binding.origins} == {
+            "https://one.example.com",
+            "https://new.example.com",
+        }
+        assert (await store.get_binding_for_origin("https://new.example.com")).repository_id == 101
+
+        recovered_binding = await store.recover_binding(
+            RepositoryBinding.create(
+                repository_id=101,
+                repository_owner="new-owner",
+                repository_name="new-comic",
+                installation_id=789,
+                origin="https://recovery.example.com",
+            )
+        )
+        assert recovered_binding.status is BindingStatus.ACTIVE
+        assert recovered_binding.installation_id == 789
+        recovery_lookup = await store.get_binding_for_origin("https://recovery.example.com")
+        assert recovery_lookup is not None
+        assert recovery_lookup.repository_id == 101
 
         refreshed_binding = await store.refresh_repository_metadata(
             101,

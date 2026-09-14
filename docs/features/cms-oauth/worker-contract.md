@@ -28,7 +28,19 @@ The public GitHub App has a setup URL and redirects to it after installation cha
 
 A binding is keyed by repository ID and contains active origin records, installation metadata, mutable owner/repository display metadata, status, and non-secret audit timestamps. One repository may have multiple active origins.
 
-Normal domain migration starts from an existing active origin, creates a short-lived pending origin, and activates it only after a popup from that exact new origin completes the handshake. The old origin remains active for the configured grace period. Lost-origin recovery, repository transfers, and changed App repository selection require fresh explicit setup/enrollment verification.
+Normal domain migration uses `GET /origins/migrate?target_origin=<https-origin>` from an
+existing active CMS site. Its popup captures the source site's actual browser origin, requires
+fresh GitHub authorization, and writes a short-lived pending target. The target site then opens
+`GET /origins/complete`; only a popup whose actual opener origin exactly matches that pending
+target can activate it. The source origin remains active until its configured grace period ends.
+The worker removes an expired source-origin index lazily when it is next looked up; it is already
+ineligible to authorize immediately at the grace-period boundary.
+
+When GitHub no longer verifies the selected installation or repository, the worker marks the
+binding `recovery_required` and refuses new tokens. A new self-service enrollment or App setup
+flow may restore the same immutable repository-ID binding after fresh installation and repository
+verification. This supports repository transfers, App repository-selection changes, and recovery
+when the old CMS origin is no longer available.
 
 ## Access Policy
 

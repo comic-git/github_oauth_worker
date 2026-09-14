@@ -31,6 +31,7 @@ class OAuthState(BaseModel):
     flow: OAuthFlow
     nonce: str
     origin: str | None = None
+    target_origin: str | None = None
     repository_id: int | None = Field(default=None, gt=0)
     installation_id: int | None = Field(default=None, gt=0)
 
@@ -48,12 +49,17 @@ class OAuthState(BaseModel):
             raise ValueError("Setup OAuth state requires an origin and installation context.")
         if self.flow is OAuthFlow.ENROLLMENT and (
             self.origin is None
+            or self.target_origin is not None
             or self.repository_id is not None
             or self.installation_id is not None
         ):
             raise ValueError("Enrollment OAuth state requires only an origin.")
-        if self.flow is OAuthFlow.ORIGIN_MIGRATION and any(value is not None for value in context):
-            raise ValueError("Origin-migration OAuth state may not contain enrollment context yet.")
+        if self.flow is OAuthFlow.ORIGIN_MIGRATION and (
+            any(value is None for value in context) or self.target_origin is None
+        ):
+            raise ValueError("Origin-migration OAuth state requires source and target contexts.")
+        if self.flow in (OAuthFlow.DECAP, OAuthFlow.SETUP) and self.target_origin is not None:
+            raise ValueError("Only origin-migration state may contain a target origin.")
         return self
 
 
@@ -128,6 +134,22 @@ class OAuthStateManager:
         """Create setup state for an untrusted App installation pending fresh user verification."""
         return self._issue_with_context(OAuthFlow.SETUP, origin, installation_id=installation_id)
 
+    def issue_origin_migration(
+        self,
+        source_origin: str,
+        target_origin: str,
+        repository_id: int,
+        installation_id: int,
+    ) -> IssuedOAuthState:
+        """Bind a fresh owner authorization to one source origin and one pending destination."""
+        return self._issue_with_context(
+            OAuthFlow.ORIGIN_MIGRATION,
+            source_origin,
+            repository_id,
+            installation_id,
+            target_origin,
+        )
+
     def attach_correlation_cookie(self, response: Response, issued_state: IssuedOAuthState) -> None:
         """Bind a browser OAuth flow to its secure, host-only correlation cookie."""
         response.set_cookie(
@@ -197,6 +219,7 @@ class OAuthStateManager:
         origin: str,
         repository_id: int | None = None,
         installation_id: int | None = None,
+        target_origin: str | None = None,
     ) -> IssuedOAuthState:
         """Sign state and attach a flow-specific nonce cookie for a validated callback context."""
         correlation_nonce = secrets.token_urlsafe(32)
@@ -206,6 +229,7 @@ class OAuthStateManager:
             origin=origin,
             repository_id=repository_id,
             installation_id=installation_id,
+            target_origin=target_origin,
         )
         token = self._serializer(flow).dumps(state.model_dump(mode="json"))
         return IssuedOAuthState(
