@@ -140,6 +140,90 @@ def test_ready_refresh_requires_a_bound_browser_origin_and_rechecks_github_acces
     assert denied_response.status_code == 400
 
 
+def test_unknown_origin_enrollment_requires_fresh_confirmation_before_binding() -> None:
+    store = InMemoryBindingStore()
+    client = TestClient(
+        create_app(
+            _ready_settings(),
+            binding_store=store,
+            github_client=_FakeGitHubClient(),
+        )
+    )
+
+    enrollment_start = client.post(
+        "/auth/handshake",
+        json={"origin": "https://new-cms.example.com"},
+        follow_redirects=False,
+    )
+    enrollment_state = parse_qs(urlparse(enrollment_start.headers["location"]).query)["state"][0]
+    enrollment_cookie = enrollment_start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+
+    confirmation_page = client.get(
+        f"/callback?code=one-time-code&state={enrollment_state}",
+        headers={"Cookie": f"oauth_correlation_enrollment={enrollment_cookie}"},
+    )
+    assert confirmation_page.status_code == 200
+    assert "owner/comic" in confirmation_page.text
+
+    setup_start = client.post(
+        "/enroll/select",
+        content=f"state={enrollment_state}&selection=456%3A123",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": f"oauth_correlation_enrollment={enrollment_cookie}",
+        },
+        follow_redirects=False,
+    )
+    setup_state = parse_qs(urlparse(setup_start.headers["location"]).query)["state"][0]
+    setup_cookie = setup_start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+
+    setup_callback = client.get(
+        f"/callback?code=one-time-code&state={setup_state}",
+        headers={"Cookie": f"oauth_correlation_setup={setup_cookie}"},
+    )
+    assert setup_callback.status_code == 200
+    assert "authorization:github:success:" in setup_callback.text
+    assert asyncio.run(store.get_binding_for_origin("https://new-cms.example.com")) is not None
+
+
+def test_app_setup_redirect_requires_fresh_authorization_for_its_same_installation() -> None:
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=_FakeGitHubClient(),
+    )
+    client = TestClient(app)
+
+    setup_page = client.get("/setup?installation_id=456")
+    assert setup_page.status_code == 200
+    assert 'installation_id: 456' in setup_page.text
+
+    setup_start = client.post(
+        "/setup/handshake",
+        json={"origin": "https://new-cms.example.com", "installation_id": 456},
+        follow_redirects=False,
+    )
+    setup_state = parse_qs(urlparse(setup_start.headers["location"]).query)["state"][0]
+    setup_cookie = setup_start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+
+    confirmation_page = client.get(
+        f"/callback?code=one-time-code&state={setup_state}",
+        headers={"Cookie": f"oauth_correlation_setup={setup_cookie}"},
+    )
+    assert confirmation_page.status_code == 200
+    assert "owner/comic" in confirmation_page.text
+
+    mismatch = client.post(
+        "/enroll/select",
+        content=f"state={setup_state}&selection=457%3A123",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": f"oauth_correlation_setup={setup_cookie}",
+        },
+    )
+    assert mismatch.status_code == 400
+
+
 def _ready_settings() -> WorkerSettings:
     return WorkerSettings(
         service_mode=ServiceMode.READY,
@@ -158,10 +242,10 @@ class _FakeGitHubClient:
     async def exchange_authorization_code(
         self,
         authorization_code: str,
-        repository_id: int,
+        repository_id: int | None = None,
     ) -> GitHubUserAccessToken:
         assert authorization_code == "one-time-code"
-        assert repository_id == 123
+        assert repository_id in (None, 123)
         return GitHubUserAccessToken(
             access_token=SecretStr("access-token"),
             token_type="bearer",
@@ -182,6 +266,28 @@ class _FakeGitHubClient:
             refresh_token=SecretStr("next-refresh-token"),
         )
 
+    async def list_accessible_installations(
+        self,
+        user_access_token: SecretStr,
+    ) -> tuple[object, ...]:
+        assert user_access_token.get_secret_value() == "access-token"
+        return (_FakeInstallation(id=456),)
+
+    async def list_repositories_for_installation(
+        self,
+        user_access_token: SecretStr,
+        installation_id: int,
+    ) -> tuple[GitHubRepository, ...]:
+        assert user_access_token.get_secret_value() == "access-token"
+        assert installation_id == 456
+        return (
+            GitHubRepository(
+                id=123,
+                name="comic",
+                owner=GitHubRepositoryOwner(login="owner"),
+            ),
+        )
+
     async def verify_bound_repository_access(
         self,
         user_access_token: SecretStr,
@@ -196,3 +302,10 @@ class _FakeGitHubClient:
             name="comic",
             owner=GitHubRepositoryOwner(login="owner"),
         )
+
+
+class _FakeInstallation:
+    """Minimal installation double for the enrollment repository-selection response."""
+
+    def __init__(self, id: int) -> None:
+        self.id = id

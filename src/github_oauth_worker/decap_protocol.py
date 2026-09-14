@@ -63,6 +63,31 @@ def render_handshake_page(handshake_endpoint: str = "/auth/handshake") -> str:
 </script></body></html>"""
 
 
+def render_setup_handshake_page(installation_id: int) -> str:
+    """Render a non-secret App-setup handoff that captures the CMS opener origin."""
+    installation_value = json.dumps(installation_id)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Continue setup</title></head>
+<body><script>
+(() => {{
+  const message = "authorizing:github";
+  const receiveHandshake = async (event) => {{
+    if (event.source !== window.opener || event.data !== message) return;
+    window.removeEventListener("message", receiveHandshake);
+    const response = await fetch("/setup/handshake", {{
+      method: "POST", credentials: "same-origin",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{origin: event.origin, installation_id: {installation_value}}}),
+    }});
+    document.body.textContent = await response.text();
+  }};
+  window.addEventListener("message", receiveHandshake);
+  // This initial discovery message has no token, state, or user data.
+  if (window.opener) window.opener.postMessage(message, "*");
+}})();
+</script></body></html>"""
+
+
 def render_success_callback_page(origin: str, payload: DecapTokenPayload) -> str:
     """Render a callback that delivers Decap token data only to one canonical CMS origin."""
     return _render_callback_page(

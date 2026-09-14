@@ -123,18 +123,20 @@ class GitHubAppClient:
     async def exchange_authorization_code(
         self,
         authorization_code: str,
-        repository_id: int,
+        repository_id: int | None = None,
     ) -> GitHubUserAccessToken:
         """Exchange a one-time code while asking GitHub to restrict the token to one repository."""
+        request_data = {
+            "client_id": self._client_id,
+            "client_secret": self._client_secret.get_secret_value(),
+            "code": authorization_code,
+        }
+        if repository_id is not None:
+            request_data["repository_id"] = str(repository_id)
         response_data = await self._request_json(
             "POST",
             self._OAUTH_TOKEN_URL,
-            data={
-                "client_id": self._client_id,
-                "client_secret": self._client_secret.get_secret_value(),
-                "code": authorization_code,
-                "repository_id": str(repository_id),
-            },
+            data=request_data,
             headers={"Accept": "application/json"},
         )
         return self._validate_response(GitHubUserAccessToken, response_data)

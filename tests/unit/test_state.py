@@ -30,7 +30,7 @@ def test_issued_state_requires_the_matching_cookie_nonce(
 
 
 def test_state_cannot_be_reused_for_a_different_flow(state_manager: OAuthStateManager) -> None:
-    issued_state = state_manager.issue(OAuthFlow.ENROLLMENT)
+    issued_state = state_manager.issue_enrollment("https://cms.example.com")
 
     with pytest.raises(InvalidOAuthStateError):
         state_manager.consume(
@@ -101,4 +101,8 @@ def test_invalid_state_error_is_a_generic_worker_error(state_manager: OAuthState
 def _issue_state(state_manager: OAuthStateManager, flow: OAuthFlow):
     if flow is OAuthFlow.DECAP:
         return state_manager.issue_decap("https://cms.example.com", 123, 456)
+    if flow is OAuthFlow.ENROLLMENT:
+        return state_manager.issue_enrollment("https://cms.example.com")
+    if flow is OAuthFlow.SETUP:
+        return state_manager.issue_setup("https://cms.example.com", 123, 456)
     return state_manager.issue(flow)

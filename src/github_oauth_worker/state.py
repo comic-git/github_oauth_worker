@@ -2,6 +2,7 @@
 
 import hmac
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -34,13 +35,25 @@ class OAuthState(BaseModel):
     installation_id: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
-    def validate_decap_binding_context(self) -> OAuthState:
-        """Require bound identity in Decap state while keeping other flows context-free for now."""
+    def validate_flow_context(self) -> OAuthState:
+        """Require each state flow to carry only the signed context its callback needs."""
         context = (self.origin, self.repository_id, self.installation_id)
-        if self.flow is OAuthFlow.DECAP and any(value is None for value in context):
-            raise ValueError("Decap OAuth state requires a bound origin and repository context.")
-        if self.flow is not OAuthFlow.DECAP and any(value is not None for value in context):
-            raise ValueError("Only Decap OAuth state may contain binding context.")
+        if self.flow is OAuthFlow.DECAP and any(
+            value is None for value in context
+        ):
+            raise ValueError("This OAuth state requires a bound origin and repository context.")
+        if self.flow is OAuthFlow.SETUP and (
+            self.origin is None or self.installation_id is None
+        ):
+            raise ValueError("Setup OAuth state requires an origin and installation context.")
+        if self.flow is OAuthFlow.ENROLLMENT and (
+            self.origin is None
+            or self.repository_id is not None
+            or self.installation_id is not None
+        ):
+            raise ValueError("Enrollment OAuth state requires only an origin.")
+        if self.flow is OAuthFlow.ORIGIN_MIGRATION and any(value is not None for value in context):
+            raise ValueError("Origin-migration OAuth state may not contain enrollment context yet.")
         return self
 
 
@@ -96,20 +109,24 @@ class OAuthStateManager:
         installation_id: int,
     ) -> IssuedOAuthState:
         """Create Decap state that binds the callback to an already-resolved site and repository."""
-        correlation_nonce = secrets.token_urlsafe(32)
-        state = OAuthState(
-            flow=OAuthFlow.DECAP,
-            nonce=correlation_nonce,
-            origin=origin,
-            repository_id=repository_id,
-            installation_id=installation_id,
-        )
-        token = self._serializer(OAuthFlow.DECAP).dumps(state.model_dump(mode="json"))
-        return IssuedOAuthState(
-            token=token,
-            cookie_name=self.correlation_cookie_name(OAuthFlow.DECAP),
-            correlation_nonce=correlation_nonce,
-        )
+        return self._issue_with_context(OAuthFlow.DECAP, origin, repository_id, installation_id)
+
+    def issue_enrollment(self, origin: str) -> IssuedOAuthState:
+        """Create initial enrollment state bound only to the popup's captured CMS origin."""
+        return self._issue_with_context(OAuthFlow.ENROLLMENT, origin)
+
+    def issue_setup(
+        self,
+        origin: str,
+        repository_id: int,
+        installation_id: int,
+    ) -> IssuedOAuthState:
+        """Create fresh confirmation state for the selected App installation and repository."""
+        return self._issue_with_context(OAuthFlow.SETUP, origin, repository_id, installation_id)
+
+    def issue_setup_installation(self, origin: str, installation_id: int) -> IssuedOAuthState:
+        """Create setup state for an untrusted App installation pending fresh user verification."""
+        return self._issue_with_context(OAuthFlow.SETUP, origin, installation_id=installation_id)
 
     def attach_correlation_cookie(self, response: Response, issued_state: IssuedOAuthState) -> None:
         """Bind a browser OAuth flow to its secure, host-only correlation cookie."""
@@ -146,6 +163,22 @@ class OAuthStateManager:
             raise InvalidOAuthStateError
         return state
 
+    def consume_from_cookies(
+        self,
+        state_token: str | None,
+        cookies: Mapping[str, str],
+    ) -> OAuthState:
+        """Find the one flow whose independently signed state and correlation cookie both match."""
+        for flow in OAuthFlow:
+            correlation_nonce = cookies.get(self.correlation_cookie_name(flow))
+            if correlation_nonce is None:
+                continue
+            try:
+                return self.consume(state_token, correlation_nonce, flow)
+            except InvalidOAuthStateError:
+                continue
+        raise InvalidOAuthStateError
+
     @staticmethod
     def correlation_cookie_name(flow: OAuthFlow) -> str:
         """Keep correlation cookies isolated so one flow cannot consume another's nonce."""
@@ -156,4 +189,27 @@ class OAuthStateManager:
         return URLSafeTimedSerializer(
             secret_key=self._state_signing_secret,
             salt=f"{self._SALT_PREFIX}:{flow.value}",
+        )
+
+    def _issue_with_context(
+        self,
+        flow: OAuthFlow,
+        origin: str,
+        repository_id: int | None = None,
+        installation_id: int | None = None,
+    ) -> IssuedOAuthState:
+        """Sign state and attach a flow-specific nonce cookie for a validated callback context."""
+        correlation_nonce = secrets.token_urlsafe(32)
+        state = OAuthState(
+            flow=flow,
+            nonce=correlation_nonce,
+            origin=origin,
+            repository_id=repository_id,
+            installation_id=installation_id,
+        )
+        token = self._serializer(flow).dumps(state.model_dump(mode="json"))
+        return IssuedOAuthState(
+            token=token,
+            cookie_name=self.correlation_cookie_name(flow),
+            correlation_nonce=correlation_nonce,
         )

@@ -20,6 +20,8 @@ Refresh resolves its binding from the browser request's exact `Origin` header, n
 
 An unknown CMS origin may begin enrollment. The worker captures the actual origin, authenticates the prospective owner, evaluates policy, shows the canonical origin and selected repository for confirmation, and creates a binding only after verifying that the user's App installation includes that repository.
 
+The initial enrollment token is used only to list verified installation/repository choices and is discarded before confirmation. Selecting a repository starts a fresh GitHub authorization; the worker verifies that second token against the selected installation and repository immediately before creating the binding and returning Decap credentials.
+
 The public GitHub App has a setup URL and redirects to it after installation changes. Setup `installation_id` values are untrusted input. The worker must require fresh user authorization and verify the user can access both the installation and selected repository before creating or updating a binding.
 
 ## Binding Lifecycle
