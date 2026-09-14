@@ -18,12 +18,12 @@ Logs may contain request IDs, endpoint names, status codes, and safe failure cat
 
 ## Common Failures
 
-| Symptom | Likely cause | Check |
-|---|---|---|
-| GitHub rejects the callback | Registered App callback URL differs from the deployed public URL | Compare the exact scheme, host, and path. |
-| Decap popup does not finish | Worker URL or callback message format is incorrect | Confirm Decap's configured base URL and inspect the popup's browser console. |
-| User is denied after GitHub authorization | Login is absent from the allowlist or the App is not installed for the repository | Check the normalized deployer configuration and App installation. |
-| Refresh fails | Token expired, refresh token is invalid, or policy changed | Check safe failure category and re-authenticate without logging the token. |
+| Symptom                                   | Likely cause                                                                                                          | Check                                                                          |
+|-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------|
+| GitHub rejects the callback               | Registered App callback URL differs from the deployed public URL                                                      | Compare the exact scheme, host, and path.                                      |
+| Decap popup does not finish               | Worker URL or callback message format is incorrect                                                                    | Confirm Decap's configured base URL and inspect the popup's browser console.   |
+| User is denied after GitHub authorization | Login policy denied enrollment, no active origin binding exists, or the App is not installed for the bound repository | Check the policy, binding status, and App installation.                        |
+| Refresh fails                             | Token expired, refresh token is invalid, policy changed, or the bound repository is no longer selected for the App    | Check the safe failure category and re-authenticate without logging the token. |
 
 ## Useful Diagnostics
 
