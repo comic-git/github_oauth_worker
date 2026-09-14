@@ -14,6 +14,8 @@ A successful callback sends `authorization:github:success:<json>` from the worke
 
 The worker exchanges a GitHub authorization code with the binding's repository ID, then verifies with GitHub's user installation/repository APIs that the returned token actually includes the repository. This verification is required because a requested repository ID may be ignored when it is unavailable. Refresh repeats that verification.
 
+Refresh resolves its binding from the browser request's exact `Origin` header, not Decap's advisory `site_id`. The worker returns CORS headers only for that active bound origin, then rechecks policy and repository access before returning refreshed credentials.
+
 ## Self-Service Enrollment
 
 An unknown CMS origin may begin enrollment. The worker captures the actual origin, authenticates the prospective owner, evaluates policy, shows the canonical origin and selected repository for confirmation, and creates a binding only after verifying that the user's App installation includes that repository.

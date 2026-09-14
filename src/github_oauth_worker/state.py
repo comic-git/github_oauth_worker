@@ -7,7 +7,7 @@ from enum import StrEnum
 
 from fastapi import Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from github_oauth_worker.config import ConfigurationError, WorkerSettings
 from github_oauth_worker.errors import WorkerError
@@ -29,6 +29,19 @@ class OAuthState(BaseModel):
 
     flow: OAuthFlow
     nonce: str
+    origin: str | None = None
+    repository_id: int | None = Field(default=None, gt=0)
+    installation_id: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_decap_binding_context(self) -> OAuthState:
+        """Require bound identity in Decap state while keeping other flows context-free for now."""
+        context = (self.origin, self.repository_id, self.installation_id)
+        if self.flow is OAuthFlow.DECAP and any(value is None for value in context):
+            raise ValueError("Decap OAuth state requires a bound origin and repository context.")
+        if self.flow is not OAuthFlow.DECAP and any(value is not None for value in context):
+            raise ValueError("Only Decap OAuth state may contain binding context.")
+        return self
 
 
 @dataclass(frozen=True)
@@ -73,6 +86,28 @@ class OAuthStateManager:
         return IssuedOAuthState(
             token=token,
             cookie_name=self.correlation_cookie_name(flow),
+            correlation_nonce=correlation_nonce,
+        )
+
+    def issue_decap(
+        self,
+        origin: str,
+        repository_id: int,
+        installation_id: int,
+    ) -> IssuedOAuthState:
+        """Create Decap state that binds the callback to an already-resolved site and repository."""
+        correlation_nonce = secrets.token_urlsafe(32)
+        state = OAuthState(
+            flow=OAuthFlow.DECAP,
+            nonce=correlation_nonce,
+            origin=origin,
+            repository_id=repository_id,
+            installation_id=installation_id,
+        )
+        token = self._serializer(OAuthFlow.DECAP).dumps(state.model_dump(mode="json"))
+        return IssuedOAuthState(
+            token=token,
+            cookie_name=self.correlation_cookie_name(OAuthFlow.DECAP),
             correlation_nonce=correlation_nonce,
         )
 

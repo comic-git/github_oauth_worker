@@ -1,10 +1,21 @@
-"""Tests for the bootstrap application surface."""
+"""Tests for bootstrap and ready-mode application surfaces."""
+
+import asyncio
+from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from github_oauth_worker.app import create_app
-from github_oauth_worker.config import ServiceMode, WorkerSettings
+from github_oauth_worker.bindings import InMemoryBindingStore, RepositoryBinding
+from github_oauth_worker.config import AccessPolicyMode, ServiceMode, WorkerSettings
 from github_oauth_worker.errors import WorkerUnavailableError
+from github_oauth_worker.github_client import (
+    GitHubRepository,
+    GitHubRepositoryOwner,
+    GitHubUser,
+    GitHubUserAccessToken,
+)
 
 
 def test_health_reports_bootstrap_without_configuration() -> None:
@@ -50,3 +61,138 @@ def test_expected_worker_errors_have_generic_browser_safe_responses() -> None:
     assert response.status_code == 503
     assert response.json() == {"error": "The OAuth worker is not configured."}
     assert "sensitive deployment detail" not in response.text
+
+
+def test_ready_callback_requires_cookie_and_verifies_a_bound_repository() -> None:
+    store = InMemoryBindingStore()
+    asyncio.run(
+        store.create_binding(
+            RepositoryBinding.create(
+                repository_id=123,
+                repository_owner="owner",
+                repository_name="comic",
+                installation_id=456,
+                origin="https://cms.example.com",
+            )
+        )
+    )
+    app = create_app(_ready_settings(), binding_store=store, github_client=_FakeGitHubClient())
+    client = TestClient(app)
+
+    handshake_response = client.post(
+        "/auth/handshake",
+        json={"origin": "https://cms.example.com"},
+        follow_redirects=False,
+    )
+    state = parse_qs(urlparse(handshake_response.headers["location"]).query)["state"][0]
+    cookie_value = handshake_response.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+
+    missing_cookie_response = client.get(f"/callback?code=one-time-code&state={state}")
+    assert missing_cookie_response.status_code == 400
+
+    callback_response = client.get(
+        f"/callback?code=one-time-code&state={state}",
+        headers={"Cookie": f"oauth_correlation_decap={cookie_value}"},
+    )
+    assert callback_response.status_code == 200
+    assert 'const targetOrigin = "https://cms.example.com"' in callback_response.text
+    assert "authorization:github:success:" in callback_response.text
+
+
+def test_ready_refresh_requires_a_bound_browser_origin_and_rechecks_github_access() -> None:
+    store = InMemoryBindingStore()
+    asyncio.run(
+        store.create_binding(
+            RepositoryBinding.create(
+                repository_id=123,
+                repository_owner="owner",
+                repository_name="comic",
+                installation_id=456,
+                origin="https://cms.example.com",
+            )
+        )
+    )
+    app = create_app(
+        _ready_settings(),
+        binding_store=store,
+        github_client=_FakeGitHubClient(),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/auth/refresh?provider=github",
+        content="refresh_token=refresh-token",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://cms.example.com",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["access_token"] == "access-token"
+    assert response.headers["access-control-allow-origin"] == "https://cms.example.com"
+
+    denied_response = client.post(
+        "/auth/refresh?provider=github",
+        content="refresh_token=refresh-token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert denied_response.status_code == 400
+
+
+def _ready_settings() -> WorkerSettings:
+    return WorkerSettings(
+        service_mode=ServiceMode.READY,
+        gcp_project_id="example-project",
+        public_base_url="https://worker.example.com",
+        github_app_client_id="client-id",
+        github_app_client_secret="client-secret",
+        state_signing_secret="state-secret",
+        access_policy=AccessPolicyMode.PUBLIC,
+    )
+
+
+class _FakeGitHubClient:
+    """Return one verified repository without making external network calls."""
+
+    async def exchange_authorization_code(
+        self,
+        authorization_code: str,
+        repository_id: int,
+    ) -> GitHubUserAccessToken:
+        assert authorization_code == "one-time-code"
+        assert repository_id == 123
+        return GitHubUserAccessToken(
+            access_token=SecretStr("access-token"),
+            token_type="bearer",
+            expires_in=28_800,
+            refresh_token=SecretStr("refresh-token"),
+        )
+
+    async def get_authenticated_user(self, user_access_token: SecretStr) -> GitHubUser:
+        assert user_access_token.get_secret_value() == "access-token"
+        return GitHubUser(login="marco")
+
+    async def refresh_user_access_token(self, refresh_token: SecretStr) -> GitHubUserAccessToken:
+        assert refresh_token.get_secret_value() == "refresh-token"
+        return GitHubUserAccessToken(
+            access_token=SecretStr("access-token"),
+            token_type="bearer",
+            expires_in=28_800,
+            refresh_token=SecretStr("next-refresh-token"),
+        )
+
+    async def verify_bound_repository_access(
+        self,
+        user_access_token: SecretStr,
+        installation_id: int,
+        repository_id: int,
+    ) -> GitHubRepository:
+        assert user_access_token.get_secret_value() == "access-token"
+        assert installation_id == 456
+        assert repository_id == 123
+        return GitHubRepository(
+            id=123,
+            name="comic",
+            owner=GitHubRepositoryOwner(login="owner"),
+        )

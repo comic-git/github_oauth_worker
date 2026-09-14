@@ -17,7 +17,7 @@ def test_issued_state_requires_the_matching_cookie_nonce(
     state_manager: OAuthStateManager,
     flow: OAuthFlow,
 ) -> None:
-    issued_state = state_manager.issue(flow)
+    issued_state = _issue_state(state_manager, flow)
 
     state = state_manager.consume(
         issued_state.token,
@@ -43,7 +43,7 @@ def test_state_cannot_be_reused_for_a_different_flow(state_manager: OAuthStateMa
 def test_state_rejects_a_tampered_token_or_mismatched_cookie(
     state_manager: OAuthStateManager,
 ) -> None:
-    issued_state = state_manager.issue(OAuthFlow.DECAP)
+    issued_state = _issue_state(state_manager, OAuthFlow.DECAP)
 
     with pytest.raises(InvalidOAuthStateError):
         state_manager.consume(
@@ -60,7 +60,7 @@ def test_state_expires_after_its_configured_lifetime(
 ) -> None:
     state_manager = OAuthStateManager(state_signing_secret="test-signing-secret", ttl_seconds=60)
     monkeypatch.setattr("itsdangerous.timed.time.time", lambda: 1_000)
-    issued_state = state_manager.issue(OAuthFlow.DECAP)
+    issued_state = _issue_state(state_manager, OAuthFlow.DECAP)
     monkeypatch.setattr("itsdangerous.timed.time.time", lambda: 1_061)
 
     with pytest.raises(InvalidOAuthStateError):
@@ -77,7 +77,7 @@ def test_correlation_cookie_has_browser_safe_attributes(
     flow: OAuthFlow,
 ) -> None:
     response = Response()
-    issued_state = state_manager.issue(flow)
+    issued_state = _issue_state(state_manager, flow)
 
     state_manager.attach_correlation_cookie(response, issued_state)
 
@@ -96,3 +96,9 @@ def test_invalid_state_error_is_a_generic_worker_error(state_manager: OAuthState
 
     assert isinstance(error.value, WorkerError)
     assert error.value.public_message == "The authorization request could not be verified."
+
+
+def _issue_state(state_manager: OAuthStateManager, flow: OAuthFlow):
+    if flow is OAuthFlow.DECAP:
+        return state_manager.issue_decap("https://cms.example.com", 123, 456)
+    return state_manager.issue(flow)
