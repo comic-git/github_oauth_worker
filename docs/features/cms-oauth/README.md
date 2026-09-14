@@ -21,3 +21,4 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 ## Documents
 
 - [Worker contract](worker-contract.md) - Decap endpoints, security rules, access policy, and deployment/bootstrap boundary.
+- [GitHub App registration](github-app-registration.md) - Versioned App settings, permissions, setup/update verification, and policy boundaries.
