@@ -94,7 +94,7 @@ class PulumiProgramTests(unittest.TestCase):
             project_name="github-oauth-worker-bootstrap",
             stack_name="bootstrap",
             configuration={
-                "github-oauth-worker-bootstrap:projectId": "comic-git",
+                "gcp:project": "comic-git",
                 "github-oauth-worker-bootstrap:pulumiStateBucket": "pulumi-state-test",
             },
         )

@@ -278,7 +278,8 @@ def create_environment(
 
 
 config = pulumi.Config()
-project_id = config.require("projectId")
+gcp_config = pulumi.Config("gcp")
+project_id = gcp_config.require("project")
 if config.get("region") not in (None, REGION):
     raise pulumi.RunError(f"This worker is intentionally deployed only in {REGION}.")
 (

@@ -27,6 +27,11 @@
 
 Pulumi Python lives under `infra/`. A manually created, labeled, versioned private Cloud Storage bucket holds Pulumi state because it is the substrate needed to manage all other resources. The owner-run bootstrap stack creates stable security boundaries: a protected KMS key for Pulumi secrets, labeled Artifact Registry repositories, separate test and production Firestore Native databases, runtime/CI identities, Secret Manager containers, database-scoped runtime IAM, bucket-scoped state access for CI, and repository-restricted WIF providers. The normal test and production stacks deploy only a Cloud Run revision and optional Secret Manager versions. This prevents test CI from needing project-wide IAM authority in the shared project. Production uses Firestore's `(default)` database; test uses the named `test` database so test experiments cannot touch production bindings.
 
+GitHub Actions uses `test` and `production` GitHub Environments. Each environment provides the same
+`GCP_WIF_PROVIDER` and `GCP_SERVICE_ACCOUNT` variable names with environment-specific values. The
+shared project ID, state-backend URL, and KMS secrets-provider URL are repository variables.
+Production is restricted to `master` and requires environment review before a production apply.
+
 The initial Cloud Run revision uses explicit bootstrap mode and exposes no OAuth operation until credentials and Firestore configuration are ready. Applying Pulumi or deploying requires human confirmation and a reviewed preview.
 
 ## Networking and Data
