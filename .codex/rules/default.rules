@@ -7,3 +7,21 @@ prefix_rule(
     pattern = [".\\.venv\\Scripts\\python.exe", "-m", "ruff", "check"],
     decision = "allow",
 )
+
+# Infrastructure validation runs only this repository's Pulumi program and tests.
+prefix_rule(
+    pattern = [".\\infra\\.venv\\Scripts\\python.exe", "-m", "pytest"],
+    decision = "allow",
+)
+prefix_rule(
+    pattern = [".\\infra\\.venv\\Scripts\\python.exe", "-m", "ruff", "check"],
+    decision = "allow",
+)
+prefix_rule(
+    pattern = [".\\infra\\.venv\\Scripts\\python.exe", "-m", "unittest"],
+    decision = "allow",
+)
+prefix_rule(
+    pattern = [".\\infra\\.venv\\Scripts\\python.exe", "-m", "compileall"],
+    decision = "allow",
+)

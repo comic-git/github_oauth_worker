@@ -30,6 +30,20 @@ Every behavioral or security change requires automated coverage. Tests must exer
 
 The normal suite must not contact GitHub, Cloud Run, Secret Manager, or a real repository. Live GitHub App tests are opt-in and use a dedicated sandbox account, App, and repository.
 
+## Infrastructure Checks
+
+The Pulumi programs use a separate, ignored venv so normal application development does not need
+GCP provider packages. Create it once and run its offline resource-graph checks with:
+
+```powershell
+py -3.14 -m venv infra\.venv
+.\infra\.venv\Scripts\python.exe -m pip install -r infra\requirements.txt
+.\infra\.venv\Scripts\python.exe -m unittest infra.tests.test_programs
+```
+
+These checks use Pulumi mocks and do not authenticate to, inspect, or create GCP resources. A
+reviewed Pulumi preview is still required before an owner applies a bootstrap or environment stack.
+
 ## Required Initial Coverage
 
 - Reject unsupported providers, invalid `site_id` values, missing state, expired state, and state/cookie mismatches.

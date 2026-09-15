@@ -1,0 +1,4 @@
+config:
+  github-oauth-worker-infra:environment: test
+  github-oauth-worker-infra:projectId: comic-git
+  github-oauth-worker-infra:firestoreDatabaseId: test

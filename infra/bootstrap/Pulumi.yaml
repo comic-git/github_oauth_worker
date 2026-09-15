@@ -1,0 +1,4 @@
+name: github-oauth-worker-bootstrap
+runtime:
+  name: python
+description: Owner-run bootstrap identities for github_oauth_worker infrastructure CI.

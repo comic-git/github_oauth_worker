@@ -1,0 +1,2 @@
+pulumi>=3.227,<4
+pulumi-gcp>=9,<10

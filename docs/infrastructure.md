@@ -18,13 +18,14 @@
 | Cloud Run                | Separate public stateless FastAPI workers with scale-to-zero.                                |
 | Firestore Native         | Separate test and production databases for bindings and limited non-secret enrollment state. |
 | Artifact Registry        | Stores worker deployment artifacts.                                                          |
+| Cloud Storage            | Holds versioned, private Pulumi state outside the managed resource graph.                    |
 | Secret Manager           | Holds environment-specific GitHub client and state-signing secrets.                          |
+| Cloud KMS                | Encrypts Pulumi secret configuration and secret-marked state values.                         |
 | Service Accounts and IAM | Limits each worker to its own Firestore database and required secrets.                       |
-| Cloud Billing budget     | Alerts the operator before unexpected spending.                                              |
 
 ## Infrastructure as Code
 
-Pulumi Python will live under `infra/`. It creates labeled GCP resources, separate test and production Firestore Native databases, and database-scoped runtime IAM. Both stacks use the same explicit GCP project while naming their environment, public worker URL, GitHub App configuration, Firestore database ID, and origin grace period. Production uses Firestore's `(default)` database; test uses the named `test` database so test experiments cannot touch production bindings.
+Pulumi Python lives under `infra/`. A manually created, labeled, versioned private Cloud Storage bucket holds Pulumi state because it is the substrate needed to manage all other resources. The owner-run bootstrap stack creates stable security boundaries: a protected KMS key for Pulumi secrets, labeled Artifact Registry repositories, separate test and production Firestore Native databases, runtime/CI identities, Secret Manager containers, database-scoped runtime IAM, bucket-scoped state access for CI, and repository-restricted WIF providers. The normal test and production stacks deploy only a Cloud Run revision and optional Secret Manager versions. This prevents test CI from needing project-wide IAM authority in the shared project. Production uses Firestore's `(default)` database; test uses the named `test` database so test experiments cannot touch production bindings.
 
 The initial Cloud Run revision uses explicit bootstrap mode and exposes no OAuth operation until credentials and Firestore configuration are ready. Applying Pulumi or deploying requires human confirmation and a reviewed preview.
 
@@ -36,8 +37,8 @@ Firestore is chosen over Cloud SQL because binding operations are low-volume dir
 
 ## Labels
 
-Every label-capable resource carries `product=github_oauth_worker`, plus `service=github-oauth-worker` and `environment=test` or `environment=production`. The Cloud Run service names are `github-oauth-worker-test` and `github-oauth-worker-production`.
+Every label-capable resource carries `product=github_oauth_worker`, plus `service=github-oauth-worker` and the matching environment label. The manually created Pulumi state bucket and KMS key are shared by both environments and use `environment=shared`; all other resources use `environment=test` or `environment=production`. The Cloud Run service names are `github-oauth-worker-test` and `github-oauth-worker-production`.
 
 ## Secrets
 
-The deployer generates a GitHub App client secret in GitHub settings and provides it, together with a state-signing secret, through Pulumi secret configuration or Secret Manager. Never place secrets in a registration checklist, `.env.example`, command history, source, Pulumi non-secret configuration, logs, test fixtures, or browser errors.
+The deployer generates a GitHub App client secret in GitHub settings and provides it, together with a state-signing secret, through Pulumi secret configuration or Secret Manager. The bootstrap stack is initialized once with a temporary passphrase because it creates the KMS key that subsequently encrypts Pulumi secret configuration. The owner immediately migrates that stack to the KMS provider; normal stacks use the KMS provider from initialization. CI has encrypt/decrypt access to this one key, while Cloud Run has no KMS permission. Never place secrets in a registration checklist, `.env.example`, command history, source, Pulumi non-secret configuration, logs, test fixtures, or browser errors.

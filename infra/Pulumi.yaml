@@ -1,0 +1,4 @@
+name: github-oauth-worker-infra
+runtime:
+  name: python
+description: Test and production infrastructure for github_oauth_worker.

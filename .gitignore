@@ -2,6 +2,10 @@
 .env
 .venv/
 venv/
+infra/.venv/
+infra/bootstrap/.venv/
+infra/bootstrap/Pulumi.*.yaml
+!infra/bootstrap/Pulumi.*.example.yaml
 __pycache__/
 .pytest_cache/
 .coverage

@@ -1,0 +1,5 @@
+# Copy this file to Pulumi.bootstrap.yaml before initializing the bootstrap stack.
+# The copied file is ignored because it holds deployment-specific configuration.
+config:
+  github-oauth-worker-bootstrap:githubRepository: <github-owner>/<repository>
+  github-oauth-worker-bootstrap:projectId: <gcp-project-id>
