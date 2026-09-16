@@ -25,6 +25,7 @@ Copy `.env.example` to an untracked `.env` before later configuration work adds 
 Self-hosted deployments must keep the default `ACCESS_POLICY=github_login_whitelist` and define `GITHUB_LOGIN_WHITELIST`. The `public` policy exists only for the comic_git-operated shared worker.
 
 See [`docs/dev_setup.md`](docs/dev_setup.md) for planned prerequisites and the local-development boundary.
+Before creating or deploying a hosted worker, follow the owner setup in [`infra/README.md`](infra/README.md).
 
 ## Docs
 

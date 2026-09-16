@@ -50,7 +50,7 @@ class PulumiProgramTests(unittest.TestCase):
             stack_name="test",
             configuration={
                 "github-oauth-worker-infra:environment": "test",
-                "github-oauth-worker-infra:projectId": "comic-git",
+                "gcp:project": "comic-git",
                 "github-oauth-worker-infra:firestoreDatabaseId": "test",
                 (
                     "github-oauth-worker-infra:imageUri"
@@ -67,7 +67,7 @@ class PulumiProgramTests(unittest.TestCase):
             stack_name="test",
             configuration={
                 "github-oauth-worker-infra:environment": "test",
-                "github-oauth-worker-infra:projectId": "comic-git",
+                "gcp:project": "comic-git",
                 "github-oauth-worker-infra:firestoreDatabaseId": "test",
                 "github-oauth-worker-infra:imageUri": (
                     "us-west1-docker.pkg.dev/comic-git/test/worker@sha256:" + "a" * 64

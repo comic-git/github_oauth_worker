@@ -32,13 +32,14 @@ def runtime_service_account_id(environment: str) -> str:
 
 
 config = pulumi.Config()
+gcp_config = pulumi.Config("gcp")
 environment = config.require("environment")
 if environment not in {"test", "production"}:
     raise pulumi.RunError("environment must be either 'test' or 'production'.")
 if pulumi.get_stack() != environment:
     raise pulumi.RunError("The Pulumi stack name must match the configured environment.")
 
-project_id = config.require("projectId")
+project_id = gcp_config.require("project")
 database_id = config.require("firestoreDatabaseId")
 expected_database_id = "test" if environment == "test" else "(default)"
 if database_id != expected_database_id:
