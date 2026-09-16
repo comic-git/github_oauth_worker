@@ -25,3 +25,9 @@ prefix_rule(
     pattern = [".\\infra\\.venv\\Scripts\\python.exe", "-m", "compileall"],
     decision = "allow",
 )
+
+# Preview queries provider state and evaluates the local infrastructure program without changing resources.
+prefix_rule(
+    pattern = ["pulumi", "preview"],
+    decision = "allow",
+)
