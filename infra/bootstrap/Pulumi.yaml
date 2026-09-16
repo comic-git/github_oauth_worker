@@ -1,4 +1,7 @@
 name: github-oauth-worker-bootstrap
 runtime:
   name: python
+  options:
+    toolchain: pip
+    virtualenv: ../.venv
 description: Owner-run bootstrap identities for github_oauth_worker infrastructure CI.

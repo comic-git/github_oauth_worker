@@ -41,8 +41,7 @@ py -3.14 -m venv infra\.venv
 .\infra\.venv\Scripts\python.exe -m unittest infra.tests.test_programs
 ```
 
-These checks use Pulumi mocks and do not authenticate to, inspect, or create GCP resources. A
-reviewed Pulumi preview is still required before an owner applies a bootstrap or environment stack.
+These checks use Pulumi mocks and do not authenticate to, inspect, or create GCP resources. They do not require Docker. A reviewed Pulumi preview is still required before an owner applies a bootstrap or environment stack; a normal-stack update requires a Docker daemon to build and push the worker.
 
 ## Required Initial Coverage
 

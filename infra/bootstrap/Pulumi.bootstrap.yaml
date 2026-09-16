@@ -1,0 +1,6 @@
+config:
+  gcp:project: comic-git
+  github-oauth-worker-bootstrap:githubRepository: comic-git/github_oauth_worker
+  github-oauth-worker-bootstrap:pulumiStateBucket: comic-git-pulumi-state
+secretsprovider: gcpkms://projects/comic-git/locations/us-west1/keyRings/github-oauth-worker-pulumi/cryptoKeys/github-oauth-worker-pulumi-secrets
+encryptedkey: CiQAyu6oI/cF4WycNf0WpRYIgPN6plWWLK9zy+FGP6JYj3EP6gcSSQDl88y6B4Ej5NQZwyPcgVwOCuDvlitMKzN/O2E9JW+Ul67lVpS7CrELqy0ckopMzy1w+BWK4LMAaSJl9COcGpWBVRsnLLnUQeE=

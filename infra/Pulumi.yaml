@@ -1,4 +1,7 @@
 name: github-oauth-worker-infra
 runtime:
   name: python
+  options:
+    toolchain: pip
+    virtualenv: .venv
 description: Test and production infrastructure for github_oauth_worker.

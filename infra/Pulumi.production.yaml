@@ -2,3 +2,5 @@ config:
   gcp:project: comic-git
   github-oauth-worker-infra:environment: production
   github-oauth-worker-infra:firestoreDatabaseId: (default)
+secretsprovider: gcpkms://projects/comic-git/locations/us-west1/keyRings/github-oauth-worker-pulumi/cryptoKeys/github-oauth-worker-pulumi-secrets
+encryptedkey: CiQAyu6oI5rFX1LzljLo/ie0fovBbJYPaNznlqj36HPbAzz4E98SSQDl88y6vg/kf3joy+4UO1JxmTwyNxeQP8+DpBSNHPZiZ2XS+d5GJseZsPicFru+/1cxx4zT5P1iXksHNWa4yF6B0UuPG8kuS24=

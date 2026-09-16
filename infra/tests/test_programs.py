@@ -26,6 +26,8 @@ class ResourceMocks(Mocks):
         self.resource_inputs: dict[str, dict[str, object]] = {}
 
     def call(self, args: MockCallArgs) -> tuple[dict[str, object], list[tuple[str, str]]]:
+        if args.token == "gcp:organizations/getClientConfig:getClientConfig":
+            return {"accessToken": "test-access-token"}, []
         if args.token == "gcp:organizations/getProject:getProject":
             return {"number": "123456789"}, []
         return {}, []
@@ -36,6 +38,10 @@ class ResourceMocks(Mocks):
         self.resource_inputs[args.name] = outputs
         outputs.setdefault("email", f"{args.name}@example.test")
         outputs.setdefault("name", args.name)
+        outputs.setdefault(
+            "repoDigest",
+            "us-west1-docker.pkg.dev/comic-git/test/worker@sha256:" + "a" * 64,
+        )
         outputs.setdefault("uri", f"https://{args.name}.example.test")
         return args.name, outputs
 
@@ -52,11 +58,17 @@ class PulumiProgramTests(unittest.TestCase):
                 "github-oauth-worker-infra:environment": "test",
                 "gcp:project": "comic-git",
                 "github-oauth-worker-infra:firestoreDatabaseId": "test",
-                (
-                    "github-oauth-worker-infra:imageUri"
-                ): "us-west1-docker.pkg.dev/comic-git/test/worker@sha256:" + "a" * 64,
             },
         )
+        self.assertIn("docker:index/image:Image", mocks.resource_types)
+        image_inputs = mocks.resource_inputs["github-oauth-worker-test-image"]
+        self.assertEqual(
+            image_inputs["imageName"],
+            "us-west1-docker.pkg.dev/comic-git/github-oauth-worker-test/worker:current",
+        )
+        self.assertEqual(image_inputs["build"]["context"], "..")
+        self.assertEqual(image_inputs["build"]["dockerfile"], r"..\Dockerfile")
+        self.assertFalse(image_inputs["buildOnPreview"])
         self.assertIn("gcp:cloudrunv2/service:Service", mocks.resource_types)
         self.assertIn("gcp:cloudrunv2/serviceIamMember:ServiceIamMember", mocks.resource_types)
 
@@ -69,9 +81,6 @@ class PulumiProgramTests(unittest.TestCase):
                 "github-oauth-worker-infra:environment": "test",
                 "gcp:project": "comic-git",
                 "github-oauth-worker-infra:firestoreDatabaseId": "test",
-                "github-oauth-worker-infra:imageUri": (
-                    "us-west1-docker.pkg.dev/comic-git/test/worker@sha256:" + "a" * 64
-                ),
                 "github-oauth-worker-infra:serviceMode": "ready",
                 "github-oauth-worker-infra:publicBaseUrl": "https://worker.example.test",
                 "github-oauth-worker-infra:githubAppClientId": "client-id",

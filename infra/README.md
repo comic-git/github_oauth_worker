@@ -29,25 +29,23 @@ GitHub App, expose the worker publicly, or configure optional billing alerts.
    pulumi login gs://<bucket-name>
    ```
 
-3. Enter the bootstrap program directory. On the first run, create the ignored local stack file
-   from its template and initialize the stack with a strong, password-manager-generated temporary
-   passphrase:
+   Both Pulumi programs are configured to use `infra/.venv`; shell activation is not required.
+
+3. Enter the bootstrap program directory and initialize the stack on its first owner run with a
+   strong, password-manager-generated temporary passphrase:
 
    ```powershell
    Set-Location infra\bootstrap
-   Copy-Item Pulumi.bootstrap.example.yaml Pulumi.bootstrap.yaml
    pulumi stack init bootstrap --secrets-provider=passphrase
    ```
 
-   For later owner runs, do not overwrite `Pulumi.bootstrap.yaml`; select the existing stack:
+   For later owner runs, select the existing stack:
 
    ```powershell
    pulumi stack select bootstrap
    ```
 
-   The first bootstrap update creates the KMS key, so it cannot use that key as its own secrets
-   provider yet. The temporary passphrase must never be committed, placed in GitHub, or pasted into
-   a command.
+   `Pulumi.bootstrap.yaml` is version-controlled with the normal stack settings. The first bootstrap update creates the KMS key, so it cannot use that key as its own secrets provider yet. The temporary passphrase must never be committed, placed in GitHub, or pasted into a command.
 
 4. Configure the bare state-bucket name. The bootstrap program grants the future test and
    production CI identities access only to this bucket:
@@ -118,33 +116,24 @@ permission and read application secrets only through Secret Manager.
 
 ## Normal Stacks
 
-`infra/` has one normal stack per environment. It requires an immutable image digest and uses
-`serviceMode=bootstrap` for the first deployment, which needs no GitHub credentials. Its exported
-`service_url` is the stable URL used to register the corresponding GitHub App.
+`infra/` has one normal stack per environment. It builds the repository Dockerfile, pushes the image to its matching Artifact Registry repository, and passes the resulting immutable digest to Cloud Run. The first deployment uses `serviceMode=bootstrap`, which needs no GitHub credentials. Its exported `service_url` is the stable URL used to register the corresponding GitHub App.
 
-Initialize the normal stacks from `infra/` only when preparing their first deployment. Use the KMS
-provider exported by the completed bootstrap stack; do not reuse the temporary bootstrap
-passphrase:
+Initialize the normal stacks from `infra/` only when preparing their first deployment. A reviewed `pulumi preview` does not build or push an image. `pulumi up` requires a Docker daemon and performs the build, push, and Cloud Run update. Use the KMS provider exported by the completed bootstrap stack; do not reuse the temporary bootstrap passphrase:
 
 ```powershell
 Set-Location ..
-$kmsProvider = pulumi stack output pulumi_secrets_provider_url --stack bootstrap
+$kmsProvider = pulumi stack output pulumi_secrets_provider_url --stack github-oauth-worker-bootstrap/bootstrap
 pulumi stack init test --secrets-provider=$kmsProvider
 pulumi stack init production --secrets-provider=$kmsProvider
 ```
 
-For later owner runs, select an existing normal stack instead of initializing it again. Before a
-reviewed first deployment, set that stack's immutable `imageUri` and apply with
-`serviceMode=bootstrap`. The image must include a `sha256` digest. The service URL produced by that
-deployment is then used during the matching GitHub App registration.
+For later owner runs, select an existing normal stack instead of initializing it again. Apply the reviewed `serviceMode=bootstrap` preview to publish the worker image and deploy the service. The service URL produced by that deployment is then used during the matching GitHub App registration.
 
 After GitHub App registration, update the stack to `serviceMode=ready` with `publicBaseUrl`,
 `githubAppClientId`, and Pulumi secret values for the App client secret and state-signing secret.
 That update creates Secret Manager versions and injects them into the Cloud Run revision.
 
-Normal local development requires no GCP credentials. Any preview or apply requires an explicit
-human review. CI will later build an immutable image, push it to the matching Artifact Registry
-repository, and pass the same digest to the normal Pulumi stack.
+Normal local development requires no GCP credentials. Any preview or apply requires an explicit human review. CI will later provide Docker and the same short-lived GCP identity used by Pulumi.
 
 ## Optional Cost Controls
 
