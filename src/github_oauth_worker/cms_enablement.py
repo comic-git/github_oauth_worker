@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import SecretStr
 
-from github_oauth_worker.engine_resolution import EngineSelector, EngineSelectorPolicy
+from github_oauth_worker.engine_resolution import EngineSelector
 from github_oauth_worker.errors import WorkerError
 from github_oauth_worker.github_client import (
     GitHubAppClient,
@@ -45,7 +45,43 @@ SUPPORTED_RUNNER_RUNTIME_PACKAGES = frozenset({"tomli-w"})
 class CmsEnablementError(WorkerError):
     """Reject an unsafe or unsupported CMS enablement operation without exposing internals."""
 
+    _PUBLIC_MESSAGES = {
+        "repository_config_invalid": (
+            "CMS setup requires exactly one readable `your_content/comic_info.ini` or "
+            "`your_content/comic_info.toml` file with an engine version."
+        ),
+        "repository_revision_invalid": (
+            "CMS setup could not read the repository's default branch revision. Try again after "
+            "confirming the repository has an ordinary default branch."
+        ),
+        "target_content_invalid": (
+            "CMS setup could not safely read this repository's `your_content` files. Use ordinary "
+            "files with supported UTF-8 source text, then try again."
+        ),
+        "engine_source_invalid": (
+            "The configured comic_git engine source could not be loaded safely. Confirm that the "
+            "configured engine version exists and is supported by this worker."
+        ),
+        "engine_contract_invalid": (
+            "The configured comic_git engine version does not include a compatible CMS migration "
+            "runner. Update to a compatible engine version and try again."
+        ),
+        "migration_runner_failed": (
+            "The configured comic_git engine could not prepare a CMS migration. Update to a "
+            "compatible engine version and try again."
+        ),
+        "migration_plan_invalid": (
+            "The configured comic_git engine returned an invalid CMS migration plan. Update to a "
+            "compatible engine version and try again."
+        ),
+    }
+    diagnostic_code = "cms_enablement_failed"
     public_message = "This repository cannot be prepared for CMS enablement by this worker."
+
+    def __init__(self, diagnostic_code: str = "cms_enablement_failed") -> None:
+        """Map an internal boundary category to a safe troubleshooting response."""
+        self.diagnostic_code = diagnostic_code
+        self.public_message = self._PUBLIC_MESSAGES.get(diagnostic_code, type(self).public_message)
 
 
 @dataclass(frozen=True)
@@ -86,6 +122,7 @@ class TargetRepositoryState:
 
     base_commit_sha: str
     tree: GitHubGitTree
+    config_path: str
     engine_selector: str
 
 
@@ -103,12 +140,12 @@ class CmsMigrationPreview:
 def extract_official_engine_archive(archive: bytes, destination: Path) -> MaterializedEngine:
     """Extract a bounded official source archive without trusting archive paths or links."""
     if len(archive) > MAXIMUM_ARCHIVE_BYTES:
-        raise CmsEnablementError
+        raise CmsEnablementError("engine_source_invalid")
     try:
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as source:
             members = source.getmembers()
             if len(members) > MAXIMUM_ARCHIVE_FILES:
-                raise CmsEnablementError
+                raise CmsEnablementError("engine_source_invalid")
             root_name = validate_archive_members(members)
             extracted_root = destination / root_name
             total_size = 0
@@ -117,15 +154,15 @@ def extract_official_engine_archive(archive: bytes, destination: Path) -> Materi
                     continue
                 total_size += member.size
                 if total_size > MAXIMUM_ARCHIVE_UNPACKED_BYTES:
-                    raise CmsEnablementError
+                    raise CmsEnablementError("engine_source_invalid")
                 target = destination.joinpath(*PurePosixPath(member.name).parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 extracted_file = source.extractfile(member)
                 if extracted_file is None:
-                    raise CmsEnablementError
+                    raise CmsEnablementError("engine_source_invalid")
                 target.write_bytes(extracted_file.read())
     except OSError, tarfile.TarError:
-        raise CmsEnablementError from None
+        raise CmsEnablementError("engine_source_invalid") from None
     return MaterializedEngine(extracted_root, load_engine_contract(extracted_root))
 
 
@@ -135,12 +172,12 @@ def validate_archive_members(members: list[tarfile.TarInfo]) -> str:
     for member in members:
         path = parse_safe_posix_path(member.name)
         if path is None:
-            raise CmsEnablementError
+            raise CmsEnablementError("engine_source_invalid")
         root_names.add(path.parts[0])
         if not (member.isdir() or member.isfile()):
-            raise CmsEnablementError
+            raise CmsEnablementError("engine_source_invalid")
     if len(root_names) != 1:
-        raise CmsEnablementError
+        raise CmsEnablementError("engine_source_invalid")
     return root_names.pop()
 
 
@@ -150,18 +187,18 @@ def load_engine_contract(engine_root: Path) -> EngineMigrationContract:
         with open(engine_root / "cms_migration_contract.json", encoding="utf-8") as f:
             data = json.load(f)
     except OSError, ValueError:
-        raise CmsEnablementError from None
+        raise CmsEnablementError("engine_contract_invalid") from None
     if not isinstance(data, dict) or data.get("protocol_version") != RUNNER_PROTOCOL_VERSION:
-        raise CmsEnablementError
+        raise CmsEnablementError("engine_contract_invalid")
     if data.get("runner_module") != RUNNER_MODULE:
-        raise CmsEnablementError
+        raise CmsEnablementError("engine_contract_invalid")
     packages = data.get("required_runtime_packages")
     if (
         not isinstance(packages, list)
         or not all(isinstance(package, str) for package in packages)
         or not set(packages).issubset(SUPPORTED_RUNNER_RUNTIME_PACKAGES)
     ):
-        raise CmsEnablementError
+        raise CmsEnablementError("engine_contract_invalid")
     return EngineMigrationContract(
         protocol_version=data["protocol_version"],
         runner_module=data["runner_module"],
@@ -178,14 +215,14 @@ async def materialize_target_snapshot(
 ) -> None:
     """Write only migration input text and inert image names from a validated Git tree."""
     if tree.truncated or len(tree.tree) > MAXIMUM_SNAPSHOT_FILES:
-        raise CmsEnablementError
+        raise CmsEnablementError("target_content_invalid")
     total_text_bytes = 0
     for entry in tree.tree:
         path = validated_content_path(entry.path)
         if path is None:
             continue
         if entry.type != "blob" or entry.mode == "120000":
-            raise CmsEnablementError
+            raise CmsEnablementError("target_content_invalid")
         target = destination.joinpath(*PurePosixPath(path).parts)
         suffix = target.suffix.casefold()
         if suffix in IMAGE_SUFFIXES:
@@ -195,14 +232,14 @@ async def materialize_target_snapshot(
         if suffix not in TEXT_SOURCE_SUFFIXES:
             continue
         if entry.size is None or entry.size > MAXIMUM_SNAPSHOT_TEXT_FILE_BYTES:
-            raise CmsEnablementError
+            raise CmsEnablementError("target_content_invalid")
         total_text_bytes += entry.size
         if total_text_bytes > MAXIMUM_SNAPSHOT_TEXT_BYTES:
-            raise CmsEnablementError
+            raise CmsEnablementError("target_content_invalid")
         blob = await client.get_repository_blob(user_access_token, repository, entry.sha)
         text = decode_text_blob(blob)
         if len(text.encode("utf-8")) != entry.size:
-            raise CmsEnablementError
+            raise CmsEnablementError("target_content_invalid")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8", newline="\n")
 
@@ -211,7 +248,7 @@ def validated_content_path(value: str) -> str | None:
     """Accept only ordinary paths within your_content and reject traversal-like Git tree names."""
     path = parse_safe_posix_path(value)
     if path is None:
-        raise CmsEnablementError
+        raise CmsEnablementError("target_content_invalid")
     if path.parts[0] != "your_content":
         return None
     return path.as_posix()
@@ -233,13 +270,13 @@ def parse_safe_posix_path(value: str) -> PurePosixPath | None:
 
 
 def decode_text_blob(blob: GitHubGitBlob) -> str:
-    """Decode one GitHub base64 text blob without accepting alternate encodings or invalid UTF-8."""
+    """Decode GitHub's standard multiline Base64 blob form as UTF-8 source text."""
     if blob.encoding != "base64":
-        raise CmsEnablementError
+        raise CmsEnablementError("target_content_invalid")
     try:
-        return base64.b64decode(blob.content, validate=True).decode("utf-8")
+        return base64.b64decode(blob.content).decode("utf-8")
     except UnicodeDecodeError, ValueError:
-        raise CmsEnablementError from None
+        raise CmsEnablementError("target_content_invalid") from None
 
 
 def run_engine_migration(
@@ -274,9 +311,9 @@ def run_engine_migration(
                 check=False,
             )
     except OSError, subprocess.TimeoutExpired:
-        raise CmsEnablementError from None
+        raise CmsEnablementError("migration_runner_failed") from None
     if result.returncode != 0 or len(result.stdout.encode("utf-8")) > MAXIMUM_RUNNER_OUTPUT_BYTES:
-        raise CmsEnablementError
+        raise CmsEnablementError("migration_runner_failed")
     return parse_runner_plan(result.stdout)
 
 
@@ -285,23 +322,23 @@ def parse_runner_plan(output: str) -> RunnerMigrationPlan:
     try:
         data = json.loads(output)
     except ValueError:
-        raise CmsEnablementError from None
+        raise CmsEnablementError("migration_plan_invalid") from None
     if not isinstance(data, dict) or data.get("protocol_version") != RUNNER_PROTOCOL_VERSION:
-        raise CmsEnablementError
+        raise CmsEnablementError("migration_plan_invalid")
     files = data.get("files")
     if not isinstance(files, list) or not files:
-        raise CmsEnablementError
+        raise CmsEnablementError("migration_plan_invalid")
     planned_files = []
     paths = set()
     for file_data in files:
         if not isinstance(file_data, dict):
-            raise CmsEnablementError
+            raise CmsEnablementError("migration_plan_invalid")
         path = file_data.get("path")
         content = file_data.get("content")
         if not isinstance(path, str) or not isinstance(content, str):
-            raise CmsEnablementError
+            raise CmsEnablementError("migration_plan_invalid")
         if path in paths or validated_content_path(path) != path or not path.endswith(".toml"):
-            raise CmsEnablementError
+            raise CmsEnablementError("migration_plan_invalid")
         paths.add(path)
         planned_files.append(MigrationPlanFile(path, content))
     return RunnerMigrationPlan(tuple(planned_files))
@@ -314,21 +351,22 @@ async def read_target_repository_state(
 ) -> TargetRepositoryState:
     """Read a target revision and only its main-config engine selector before source resolution."""
     if repository.default_branch is None:
-        raise CmsEnablementError
+        raise CmsEnablementError("repository_revision_invalid")
     ref = await client.get_repository_ref(
         user_access_token, repository, f"heads/{repository.default_branch}"
     )
     if ref.object.type != "commit":
-        raise CmsEnablementError
+        raise CmsEnablementError("repository_revision_invalid")
     commit = await client.get_repository_commit(user_access_token, repository, ref.object.sha)
     tree = await client.get_repository_tree(user_access_token, repository, commit.tree.sha)
     if tree.truncated:
-        raise CmsEnablementError
+        raise CmsEnablementError("repository_revision_invalid")
     config_entry = _main_config_entry(tree)
     blob = await client.get_repository_blob(user_access_token, repository, config_entry.sha)
     return TargetRepositoryState(
         base_commit_sha=commit.sha,
         tree=tree,
+        config_path=config_entry.path,
         engine_selector=parse_engine_selector(config_entry.path, decode_text_blob(blob)),
     )
 
@@ -338,12 +376,11 @@ async def build_migration_preview(
     user_access_token: SecretStr,
     repository: GitHubRepository,
     state: TargetRepositoryState,
-    selector_policy: EngineSelectorPolicy,
+    selector: EngineSelector,
+    engine_commit_sha: str,
     cms_enablement: dict[str, object],
 ) -> CmsMigrationPreview:
-    """Resolve approved engine code and return only its validated migration-plan summary."""
-    selector = selector_policy.select(state.engine_selector)
-    engine_commit_sha = await resolve_official_engine_commit(client, selector)
+    """Run an already-resolved official engine revision and return its migration summary."""
     archive = await client.download_official_engine_archive(engine_commit_sha)
     with tempfile.TemporaryDirectory() as workspace:
         workspace_root = Path(workspace)
@@ -373,7 +410,7 @@ async def resolve_official_engine_commit(
     """Resolve one approved official branch to a verified immutable commit SHA."""
     reference = await client.resolve_official_engine_ref(selector.ref)
     if reference.object.type != "commit":
-        raise CmsEnablementError
+        raise CmsEnablementError("engine_source_invalid")
     commit = await client.get_official_engine_commit(reference.object.sha)
     return commit.sha
 
@@ -390,9 +427,9 @@ def parse_engine_selector(config_path: str, contents: str) -> str:
             parser.read_string(contents)
             value = parser.get("Comic Settings", "Engine version", fallback=None)
     except configparser.Error, tomllib.TOMLDecodeError:
-        raise CmsEnablementError from None
+        raise CmsEnablementError("repository_config_invalid") from None
     if not isinstance(value, str) or not value.strip():
-        raise CmsEnablementError
+        raise CmsEnablementError("repository_config_invalid")
     return value.strip()
 
 
@@ -404,5 +441,5 @@ def _main_config_entry(tree: GitHubGitTree):
         if entry.path in {"your_content/comic_info.toml", "your_content/comic_info.ini"}
     ]
     if len(entries) != 1 or entries[0].type != "blob" or entries[0].mode == "120000":
-        raise CmsEnablementError
+        raise CmsEnablementError("repository_config_invalid")
     return entries[0]

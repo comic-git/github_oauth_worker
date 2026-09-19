@@ -60,9 +60,19 @@ def render_origin_completion_handshake_page() -> str:
     )
 
 
-def render_management_result_page(message: str) -> str:
-    """Render a non-secret management result for the administrator who opened the popup."""
-    return render_template("management_result.tpl", message=message)
+def render_management_result_page(
+    message: str,
+    *,
+    heading: str = "comic_git CMS setup",
+    diagnostic_code: str | None = None,
+) -> str:
+    """Render a safe setup result with optional operator-facing troubleshooting classification."""
+    return render_template(
+        "management_result.tpl",
+        message=message,
+        heading=heading,
+        diagnostic_code=diagnostic_code,
+    )
 
 
 def render_success_callback_page(origin: str, payload: DecapTokenPayload) -> str:

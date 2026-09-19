@@ -1,6 +1,5 @@
 """FastAPI application composition for the GitHub OAuth worker."""
 
-import logging
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlencode
 
@@ -15,7 +14,13 @@ from github_oauth_worker.bindings import (
     RepositoryBinding,
     canonicalize_origin,
 )
-from github_oauth_worker.cms_enablement import build_migration_preview, read_target_repository_state
+from github_oauth_worker.cms_enablement import (
+    CmsMigrationPreview,
+    TargetRepositoryState,
+    build_migration_preview,
+    read_target_repository_state,
+    resolve_official_engine_commit,
+)
 from github_oauth_worker.cms_setup import (
     render_cms_migration_result_page,
     render_cms_migration_summary_page,
@@ -37,15 +42,16 @@ from github_oauth_worker.enablement_operations import (
     EnablementOperationStore,
     FirestoreEnablementOperationStore,
 )
-from github_oauth_worker.engine_resolution import EngineSelectorPolicy
+from github_oauth_worker.engine_resolution import EngineSelectorError, EngineSelectorPolicy
 from github_oauth_worker.enrollment import render_enrollment_confirmation_page
 from github_oauth_worker.errors import WorkerError
 from github_oauth_worker.github_client import (
     GitHubAccessVerificationError,
     GitHubAppClient,
+    GitHubRepository,
     GitHubTreeChange,
 )
-from github_oauth_worker.logging import log_event
+from github_oauth_worker.logging import configure_event_logger, log_event
 from github_oauth_worker.policy import AccessOperation, build_access_policy
 from github_oauth_worker.state import IssuedOAuthState, OAuthFlow, OAuthState, OAuthStateManager
 
@@ -118,7 +124,14 @@ def create_app(
 ) -> FastAPI:
     """Create the worker and compose ready-mode dependencies only after settings validation."""
     worker_settings = settings or load_settings()
-    logger = logging.getLogger(__name__)
+    logger = configure_event_logger(
+        project_id=worker_settings.gcp_project_id,
+        labels={
+            "product": "github_oauth_worker",
+            "service": "github-oauth-worker",
+            "environment": worker_settings.environment.value,
+        },
+    )
     app = FastAPI(
         title="github_oauth_worker",
         docs_url=None,
@@ -408,7 +421,11 @@ def create_app(
                     logger,
                     "oauth_callback_failed",
                     flow=oauth_state.flow,
-                    error=error.public_message,
+                    repository_id=oauth_state.repository_id,
+                    error_type=type(error).__name__,
+                    diagnostic_code=error.diagnostic_code,
+                    status_code=error.status_code,
+                    public_message=error.public_message,
                 )
                 if oauth_state.flow in {
                     OAuthFlow.CMS_ENABLEMENT_INSTALLATION,
@@ -416,12 +433,20 @@ def create_app(
                     OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
                 }:
                     return HTMLResponse(
-                        render_management_result_page(error.public_message),
+                        render_management_result_page(
+                            error.public_message,
+                            heading="comic_git CMS setup could not continue",
+                            diagnostic_code=error.diagnostic_code,
+                        ),
                         status_code=error.status_code,
                     )
                 if oauth_state.flow is OAuthFlow.ORIGIN_MIGRATION:
                     return HTMLResponse(
-                        render_management_result_page(error.public_message),
+                        render_management_result_page(
+                            error.public_message,
+                            heading="CMS origin migration could not continue",
+                            diagnostic_code=error.diagnostic_code,
+                        ),
                         status_code=error.status_code,
                     )
                 return HTMLResponse(
@@ -532,11 +557,105 @@ def create_app(
             )
             if not repositories or state_token is None:
                 raise WorkerError
+            log_event(
+                logger,
+                "cms_setup_repository_selection_ready",
+                installation_id=oauth_state.installation_id,
+                github_login=github_user.login,
+                repository_count=len(repositories),
+            )
             return HTMLResponse(
                 render_cms_repository_selection_page(
                     state_token, oauth_state.installation_id, repositories
                 )
             )
+
+        async def build_logged_cms_migration_preview(
+            repository: GitHubRepository,
+            user_access_token: SecretStr,
+        ) -> tuple[TargetRepositoryState, CmsMigrationPreview]:
+            """Log non-secret setup milestones around the bounded migration-planning boundary."""
+            repository_fields = {
+                "repository_id": repository.id,
+                "repository_owner": repository.owner.login,
+                "repository_name": repository.name,
+                "default_branch": repository.default_branch,
+            }
+            log_event(logger, "cms_setup_repository_verified", **repository_fields)
+            target_state = await read_target_repository_state(
+                app.state.github_client, user_access_token, repository
+            )
+            log_event(
+                logger,
+                "cms_setup_target_state_read",
+                **repository_fields,
+                base_commit_sha=target_state.base_commit_sha,
+                config_path=target_state.config_path,
+                declared_engine_selector=target_state.engine_selector,
+                tree_entry_count=len(target_state.tree.tree),
+            )
+            selector_policy = EngineSelectorPolicy.from_settings(worker_settings)
+            log_event(
+                logger,
+                "cms_setup_engine_selector_validation_started",
+                **repository_fields,
+                declared_engine_selector=target_state.engine_selector,
+                minimum_engine_version=worker_settings.cms_minimum_engine_version,
+                allowed_engine_branches=sorted(worker_settings.cms_allowed_engine_branches),
+            )
+            try:
+                selector = selector_policy.select(target_state.engine_selector)
+            except EngineSelectorError as error:
+                log_event(
+                    logger,
+                    "cms_setup_engine_selector_rejected",
+                    **repository_fields,
+                    declared_engine_selector=target_state.engine_selector,
+                    error_type=type(error).__name__,
+                    diagnostic_code=error.diagnostic_code,
+                    public_message=error.public_message,
+                )
+                raise
+            log_event(
+                logger,
+                "cms_setup_engine_source_requested",
+                **repository_fields,
+                declared_engine_selector=selector.value,
+                engine_ref=selector.ref,
+                minimum_engine_version=worker_settings.cms_minimum_engine_version,
+                allowed_engine_branches=sorted(worker_settings.cms_allowed_engine_branches),
+            )
+            engine_commit_sha = await resolve_official_engine_commit(
+                app.state.github_client, selector
+            )
+            log_event(
+                logger,
+                "cms_setup_engine_source_resolved",
+                **repository_fields,
+                declared_engine_selector=selector.value,
+                engine_ref=selector.ref,
+                engine_commit_sha=engine_commit_sha,
+            )
+            preview = await build_migration_preview(
+                app.state.github_client,
+                user_access_token,
+                repository,
+                target_state,
+                selector,
+                engine_commit_sha,
+                _cms_enablement_input(worker_settings, repository),
+            )
+            log_event(
+                logger,
+                "cms_setup_migration_preview_ready",
+                **repository_fields,
+                base_commit_sha=preview.base_commit_sha,
+                engine_selector=preview.engine_selector,
+                engine_commit_sha=preview.engine_commit_sha,
+                planned_file_count=len(preview.files),
+                planned_paths=preview.changed_paths,
+            )
+            return target_state, preview
 
         async def cms_enablement_repository_callback(
             oauth_state: OAuthState,
@@ -560,16 +679,8 @@ def create_app(
             await app.state.github_client.require_repository_administrator(
                 access_token.access_token, repository, github_user.login
             )
-            target_state = await read_target_repository_state(
-                app.state.github_client, access_token.access_token, repository
-            )
-            preview = await build_migration_preview(
-                app.state.github_client,
-                access_token.access_token,
-                repository,
-                target_state,
-                EngineSelectorPolicy.from_settings(worker_settings),
-                _cms_enablement_input(worker_settings, repository),
+            _, preview = await build_logged_cms_migration_preview(
+                repository, access_token.access_token
             )
             confirmation = app.state.state_manager.issue_cms_enablement_confirmation(
                 repository.id,
@@ -607,16 +718,8 @@ def create_app(
             await app.state.github_client.require_repository_administrator(
                 access_token.access_token, repository, github_user.login
             )
-            target_state = await read_target_repository_state(
-                app.state.github_client, access_token.access_token, repository
-            )
-            preview = await build_migration_preview(
-                app.state.github_client,
-                access_token.access_token,
-                repository,
-                target_state,
-                EngineSelectorPolicy.from_settings(worker_settings),
-                _cms_enablement_input(worker_settings, repository),
+            target_state, preview = await build_logged_cms_migration_preview(
+                repository, access_token.access_token
             )
             if (
                 preview.base_commit_sha != oauth_state.base_commit_sha
@@ -635,6 +738,15 @@ def create_app(
                 )
             )
             if operation.pull_request_url is not None:
+                log_event(
+                    logger,
+                    "cms_setup_existing_pull_request_returned",
+                    repository_id=repository.id,
+                    repository_owner=repository.owner.login,
+                    repository_name=repository.name,
+                    base_commit_sha=preview.base_commit_sha,
+                    pull_request_url=operation.pull_request_url,
+                )
                 return HTMLResponse(render_cms_migration_result_page(operation.pull_request_url))
             claim = await app.state.operation_store.claim_writing(
                 repository.id, preview.base_commit_sha
@@ -651,9 +763,28 @@ def create_app(
                     existing_pr.number,
                     existing_pr.html_url,
                 )
+                log_event(
+                    logger,
+                    "cms_setup_existing_pull_request_recovered",
+                    repository_id=repository.id,
+                    repository_owner=repository.owner.login,
+                    repository_name=repository.name,
+                    base_commit_sha=preview.base_commit_sha,
+                    pull_request_url=operation.pull_request_url,
+                )
                 return HTMLResponse(
                     render_cms_migration_result_page(operation.pull_request_url or "")
                 )
+            log_event(
+                logger,
+                "cms_setup_migration_write_started",
+                repository_id=repository.id,
+                repository_owner=repository.owner.login,
+                repository_name=repository.name,
+                base_commit_sha=preview.base_commit_sha,
+                branch_name=branch_name,
+                planned_file_count=len(preview.files),
+            )
             changes = tuple(GitHubTreeChange(file.path, file.content) for file in preview.files)
             blobs = await app.state.github_client.create_repository_blobs(
                 access_token.access_token, repository, changes
@@ -667,6 +798,16 @@ def create_app(
                 "Enable comic_git CMS",
                 tree.sha,
                 target_state.base_commit_sha,
+            )
+            log_event(
+                logger,
+                "cms_setup_migration_commit_created",
+                repository_id=repository.id,
+                repository_owner=repository.owner.login,
+                repository_name=repository.name,
+                base_commit_sha=preview.base_commit_sha,
+                commit_sha=commit.sha,
+                branch_name=branch_name,
             )
             await app.state.github_client.create_repository_branch(
                 access_token.access_token, repository, branch_name, commit.sha
@@ -684,6 +825,16 @@ def create_app(
             )
             operation = await app.state.operation_store.complete(
                 repository.id, preview.base_commit_sha, pull_request.number, pull_request.html_url
+            )
+            log_event(
+                logger,
+                "cms_setup_pull_request_created",
+                repository_id=repository.id,
+                repository_owner=repository.owner.login,
+                repository_name=repository.name,
+                base_commit_sha=preview.base_commit_sha,
+                pull_request_number=pull_request.number,
+                pull_request_url=pull_request.html_url,
             )
             return HTMLResponse(render_cms_migration_result_page(operation.pull_request_url or ""))
 

@@ -39,3 +39,19 @@ def test_policy_rejects_unapproved_or_too_old_selectors(selector: str) -> None:
 
     with pytest.raises(EngineSelectorError):
         policy.select(selector)
+
+
+def test_policy_explains_when_a_declared_release_is_too_old() -> None:
+    policy = EngineSelectorPolicy.from_settings(
+        WorkerSettings(
+            cms_minimum_engine_version="1.2",
+            cms_allowed_engine_branches="latest,master",
+        )
+    )
+
+    with pytest.raises(EngineSelectorError) as error:
+        policy.select("1.1")
+
+    assert error.value.diagnostic_code == "engine_version_too_old"
+    assert "1.2 or newer" in error.value.public_message
+    assert "1.1" in error.value.public_message

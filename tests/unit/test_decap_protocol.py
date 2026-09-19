@@ -48,14 +48,20 @@ def test_error_callback_keeps_the_exact_origin_and_escapes_script_data() -> None
     assert "authorization:github:error:" in page
 
 
-def test_management_templates_serialize_javascript_values_without_manual_escaping() -> None:
+def test_management_templates_escape_text_without_manual_escaping() -> None:
     migration_page = render_origin_migration_handshake_page("https://new-cms.example.com")
     completion_page = render_origin_completion_handshake_page()
-    result_page = render_management_result_page("<script>unexpected</script>")
+    result_page = render_management_result_page(
+        "<script>unexpected</script>",
+        heading="CMS setup could not continue",
+        diagnostic_code="engine_version_too_old",
+    )
 
     assert 'const endpoint = "/origins/migrate/handshake"' in migration_page
     assert 'target_origin: "https://new-cms.example.com"' in migration_page
     assert 'const endpoint = "/origins/complete/handshake"' in completion_page
     assert "target_origin:" not in completion_page
-    assert "\\u003cscript\\u003eunexpected\\u003c/script\\u003e" in result_page
+    assert "CMS setup could not continue" in result_page
+    assert "engine_version_too_old" in result_page
+    assert "&lt;script&gt;unexpected&lt;/script&gt;" in result_page
     assert "<script>unexpected</script>" not in result_page

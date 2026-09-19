@@ -1,6 +1,7 @@
 """Tests for bootstrap and ready-mode application surfaces."""
 
 import asyncio
+import logging
 from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
@@ -48,6 +49,14 @@ def test_health_reports_ready_without_configuration_values() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+def test_application_configures_the_dedicated_event_logger() -> None:
+    create_app(_ready_settings())
+
+    logger = logging.getLogger("github_oauth_worker.events")
+    assert logger.getEffectiveLevel() == logging.INFO
+    assert logger.propagate is False
 
 
 def test_expected_worker_errors_have_generic_browser_safe_responses() -> None:

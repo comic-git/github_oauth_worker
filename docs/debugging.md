@@ -27,6 +27,17 @@ Logs may contain request IDs, endpoint names, status codes, and safe failure cat
 
 ## Useful Diagnostics
 
+### CMS Setup Logs
+
+CMS setup uses Google's `StructuredLogHandler` to write Cloud Logging JSON records to stdout. They
+include the safe repository identity, the main config path, the declared engine selector, the
+official engine ref requested, resolved engine commit SHA, and the migration PR outcome. Search
+Cloud Run logs for `jsonPayload.event:"cms_setup_"` to follow one setup attempt.
+
+Expected setup failures include a stable `diagnostic_code` in the `oauth_callback_failed` event and
+on the administrator-facing result page. The code identifies the safe failure category; it never
+contains OAuth state, authorization codes, access tokens, or migration file contents.
+
 ```powershell
 curl https://<worker-host>/healthz
 gcloud run services describe github-oauth-worker-<environment> --region <region> --project <project-id>

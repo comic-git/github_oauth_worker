@@ -1,5 +1,7 @@
 """Validated comic_git_engine selector policy shared by setup planning and confirmation."""
 
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass
 
@@ -14,7 +16,24 @@ _VERSION_PATTERN = re.compile(
 class EngineSelectorError(WorkerError):
     """Reject an engine selector outside the deployment's CMS compatibility policy."""
 
+    diagnostic_code = "unsupported_engine_selector"
     public_message = "This repository's comic_git engine version is not supported by this worker."
+
+    def __init__(self, selector: str, minimum_version: EngineVersion | None = None) -> None:
+        """Keep a safe, actionable explanation for an invalid or too-old configured selector."""
+        if minimum_version is None:
+            self.public_message = (
+                f"This worker does not permit the configured comic_git engine selector "
+                f"{selector!r}. Use a supported release version and try CMS setup again."
+            )
+            return
+        self.diagnostic_code = "engine_version_too_old"
+        self.public_message = (
+            "This worker supports comic_git engine "
+            f"{minimum_version.major}.{minimum_version.minor} "
+            f"or newer, but this repository declares {selector!r}. Update the engine version "
+            "and try CMS setup again."
+        )
 
 
 @dataclass(frozen=True, order=True)
@@ -70,7 +89,7 @@ class EngineSelectorPolicy:
         try:
             version = EngineVersion.parse(selector)
         except ValueError:
-            raise EngineSelectorError from None
+            raise EngineSelectorError(selector) from None
         if version < self.minimum_version:
-            raise EngineSelectorError
+            raise EngineSelectorError(selector, self.minimum_version)
         return EngineSelector(value=selector, ref=f"heads/{selector}", version=version)

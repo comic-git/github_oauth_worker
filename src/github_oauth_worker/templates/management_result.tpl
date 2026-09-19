@@ -1,5 +1,11 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>CMS origin management</title></head>
-<body><script>document.body.textContent = {{ message | tojson }};</script></body>
+<head><meta charset="utf-8"><title>{{ heading }}</title></head>
+<body>
+<main>
+<h1>{{ heading }}</h1>
+<p>{{ message }}</p>
+{% if diagnostic_code %}<p>Troubleshooting code: <code>{{ diagnostic_code }}</code></p>{% endif %}
+</main>
+</body>
 </html>

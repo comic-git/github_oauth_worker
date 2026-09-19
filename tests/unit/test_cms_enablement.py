@@ -16,6 +16,7 @@ from github_oauth_worker.cms_enablement import (
     CmsEnablementError,
     EngineMigrationContract,
     MaterializedEngine,
+    decode_text_blob,
     extract_official_engine_archive,
     materialize_target_snapshot,
     parse_engine_selector,
@@ -190,6 +191,24 @@ def test_engine_selector_reads_only_the_supported_main_config_forms() -> None:
 
     with pytest.raises(CmsEnablementError):
         parse_engine_selector("your_content/comic_info.toml", "[engine]\nversion = []")
+
+
+def test_cms_enablement_errors_have_safe_troubleshooting_categories() -> None:
+    error = CmsEnablementError("engine_contract_invalid")
+
+    assert error.diagnostic_code == "engine_contract_invalid"
+    assert "compatible CMS migration runner" in error.public_message
+
+
+def test_decode_text_blob_accepts_github_style_multiline_base64() -> None:
+    source = "[Comic Settings]\nEngine version = 1.1\n"
+    blob = GitHubGitBlob(
+        sha=SHA_A,
+        encoding="base64",
+        content=base64.encodebytes(source.encode()).decode(),
+    )
+
+    assert decode_text_blob(blob) == source
 
 
 def test_runner_uses_a_scrubbed_environment_and_fixed_module(tmp_path: Path) -> None:
