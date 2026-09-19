@@ -27,6 +27,30 @@ def test_whitelist_is_casefolded_and_uses_comma_separated_config() -> None:
     assert settings.github_login_whitelist == frozenset({"marco", "editor"})
 
 
+def test_cms_engine_policy_preserves_branch_names_and_accepts_canonical_minimum_version() -> None:
+    settings = WorkerSettings(
+        cms_minimum_engine_version="1.2.3",
+        cms_allowed_engine_branches="latest, master, cms",
+    )
+
+    assert settings.cms_minimum_engine_version == "1.2.3"
+    assert settings.cms_allowed_engine_branches == frozenset({"latest", "master", "cms"})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cms_minimum_engine_version", "v1.2"),
+        ("cms_minimum_engine_version", "1.02"),
+        ("cms_allowed_engine_branches", "latest,../unsafe"),
+        ("cms_allowed_engine_branches", ""),
+    ],
+)
+def test_cms_engine_policy_rejects_invalid_config(field: str, value: str) -> None:
+    with pytest.raises(ValidationError):
+        WorkerSettings(**{field: value})
+
+
 def test_ready_mode_requires_all_sensitive_runtime_values() -> None:
     with pytest.raises(ValidationError, match="Ready mode requires"):
         WorkerSettings(service_mode=ServiceMode.READY)

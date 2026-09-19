@@ -6,6 +6,12 @@
 
 In `bootstrap` mode, the worker exposes health and setup guidance only. In `ready` mode, it requires valid App credentials and Firestore access before authorizing or enrolling users.
 
+## Planned CMS Enablement
+
+After GitHub redirects a newly installed or updated App to `GET /setup`, the planned worker behavior presents a creator-facing CMS enablement flow rather than requiring a CMS popup opener. The setup `installation_id` is untrusted. The worker starts fresh GitHub user authorization, applies policy, verifies the user can administer the selected repository in that exact installation, previews an engine-produced migration summary, and requires an explicit confirmation before creating a migration pull request.
+
+The worker reads the target's validated `engine.version` selector, resolves it once to an exact commit in the official comic_git_engine repository, and downloads that commit's supported migration runner into a temporary workspace containing only verified repository data fetched through GitHub's API. It never clones or executes target-repository code, reimplements TOML conversion, deletes legacy files, stores user tokens, or exposes repository content in logs. The resulting branch changes only files in the validated engine-produced migration plan; it preserves the target's engine version, targets the repository's default branch, and creates a pull request. The branch and pull request record the resolved engine SHA. A later direct-commit delivery mode is intentionally out of scope.
+
 ## Decap Authorization
 
 `GET /auth`, `GET /callback`, and `POST /auth/refresh` implement Decap's GitHub authentication contract. The initial popup handshake captures the actual `MessageEvent.origin` of the CMS opener. The worker uses that origin to look up an active binding; it never treats Decap's `site_id` query parameter as proof of origin ownership.
@@ -22,7 +28,7 @@ An unknown CMS origin may begin enrollment. The worker captures the actual origi
 
 The initial enrollment token is used only to list verified installation/repository choices and is discarded before confirmation. Selecting a repository starts a fresh GitHub authorization; the worker verifies that second token against the selected installation and repository immediately before creating the binding and returning Decap credentials.
 
-The public GitHub App has a setup URL and redirects to it after installation changes. Setup `installation_id` values are untrusted input. The worker must require fresh user authorization and verify the user can access both the installation and selected repository before creating or updating a binding.
+The public GitHub App has a setup URL and redirects to it after installation changes. Setup `installation_id` values are untrusted input. The worker must require fresh user authorization and verify the user can access both the installation and selected repository before creating a migration pull request or updating a binding.
 
 ## Binding Lifecycle
 

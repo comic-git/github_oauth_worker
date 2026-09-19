@@ -1,5 +1,6 @@
 """Typed configuration and startup validation for the OAuth worker."""
 
+import re
 from enum import StrEnum
 from typing import Annotated
 
@@ -72,6 +73,10 @@ class WorkerSettings(BaseSettings):
     state_signing_secret: SecretStr | None = None
     access_policy: AccessPolicyMode = AccessPolicyMode.GITHUB_LOGIN_WHITELIST
     github_login_whitelist: Annotated[frozenset[str], NoDecode] = frozenset()
+    cms_minimum_engine_version: str = "1.2"
+    cms_allowed_engine_branches: Annotated[frozenset[str], NoDecode] = frozenset(
+        {"latest", "master"}
+    )
     oauth_state_ttl_seconds: int = 600
     origin_grace_period_seconds: int = 86_400
 
@@ -88,6 +93,36 @@ class WorkerSettings(BaseSettings):
         if isinstance(value, (list, tuple, set, frozenset)):
             return frozenset(str(login).strip().casefold() for login in value if str(login).strip())
         raise ValueError("GITHUB_LOGIN_WHITELIST must be comma-separated text.")
+
+    @field_validator("cms_allowed_engine_branches", mode="before")
+    @classmethod
+    def parse_cms_allowed_engine_branches(cls, value: object) -> frozenset[str]:
+        """Accept deployment-defined branch names without changing Git case-sensitive semantics."""
+        if isinstance(value, str):
+            values = value.split(",")
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            values = value
+        else:
+            raise ValueError("CMS_ALLOWED_ENGINE_BRANCHES must be comma-separated text.")
+        branches = frozenset(str(branch).strip() for branch in values if str(branch).strip())
+        if not branches:
+            raise ValueError("CMS_ALLOWED_ENGINE_BRANCHES must contain at least one branch.")
+        for branch in branches:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch):
+                raise ValueError(f"Invalid CMS_ALLOWED_ENGINE_BRANCHES value: {branch!r}.")
+            if ".." in branch or "//" in branch or branch.endswith(("/", ".lock")):
+                raise ValueError(f"Invalid CMS_ALLOWED_ENGINE_BRANCHES value: {branch!r}.")
+        return branches
+
+    @field_validator("cms_minimum_engine_version")
+    @classmethod
+    def require_canonical_cms_minimum_engine_version(cls, value: str) -> str:
+        """Keep release policy comparisons independent from arbitrary Git ref syntax."""
+        if not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))?", value):
+            raise ValueError(
+                "CMS_MINIMUM_ENGINE_VERSION must be a canonical X.Y or X.Y.Z version."
+            )
+        return value
 
     @field_validator("public_base_url")
     @classmethod

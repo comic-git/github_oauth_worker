@@ -13,7 +13,7 @@ The comic_git-operated shared service can accept self-service enrollment for eli
 
 | Component       | Responsibility                                                                                        |
 |-----------------|-------------------------------------------------------------------------------------------------------|
-| FastAPI service | Implements Decap, enrollment, setup, migration, and health HTTP flows.                                |
+| FastAPI service | Implements Decap, enrollment, CMS enablement, origin migration, and health HTTP flows.                |
 | Binding store   | Firestore records verified repository-to-origin bindings and direct origin lookup records.            |
 | Access policy   | Allows or denies a GitHub login at enrollment, authorization, and refresh.                            |
 | GitHub App      | Defines user-token permissions and lets owners select exactly which repositories the service may use. |
@@ -32,13 +32,17 @@ The comic_git-operated shared service can accept self-service enrollment for eli
 
 ## Enrollment and Migration
 
-Enrollment verifies an App installation and user-selected repository before creating a binding. The GitHub setup URL is used after installation and installation updates, but its supplied installation ID is never trusted on its own; the worker authenticates the user and verifies the installation/repository through GitHub before writing data.
+Enrollment verifies an App installation and user-selected repository before creating a binding. The GitHub setup URL starts CMS enablement after installation and installation updates. Its supplied installation ID is never trusted on its own; the worker authenticates the user and verifies the installation/repository through GitHub before creating a reviewable migration pull request or writing a binding.
 
 Repository IDs, not owner/name strings, are binding identities. Renames only refresh display metadata. A transfer or changed App repository selection causes verification to fail safely and directs the new administrator into recovery enrollment. A custom-domain migration starts at an existing bound origin, requires the new origin's actual popup handshake to complete, and leaves the old origin active for a configured grace period.
 
+## CMS Enablement
+
+The planned first-run setup flow converts a legacy comic_git repository to CMS-ready TOML and creates a pull request for the creator to review and merge. The worker never interprets comic content itself: it invokes a pinned comic_git_engine migration library against a temporary workspace populated from verified GitHub repository data. The worker does not clone or execute repository code. A generated pull request retains legacy files, adds TOML and CMS configuration, and records the exact resolved engine SHA without changing the repository's configured engine version or submodule revision.
+
 ## External Boundaries
 
-The endpoint and security contract is in [CMS OAuth worker contract](features/cms-oauth/worker-contract.md). comic_git_engine remains the authority for CMS TOML/content compatibility; this worker does not parse comic data or act as a GitHub proxy.
+The endpoint and security contract is in [CMS OAuth worker contract](features/cms-oauth/worker-contract.md). comic_git_engine remains the authority for CMS TOML/content compatibility. The worker only orchestrates a narrow, engine-produced migration plan for an explicitly confirmed setup request; it is not a general GitHub proxy.
 
 ## Design Constraints
 

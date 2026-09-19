@@ -58,6 +58,8 @@ class PulumiProgramTests(unittest.TestCase):
                 "github-oauth-worker-infra:environment": "test",
                 "gcp:project": "comic-git",
                 "github-oauth-worker-infra:firestoreDatabaseId": "test",
+                "github-oauth-worker-infra:cmsMinimumEngineVersion": "1.2",
+                "github-oauth-worker-infra:cmsAllowedEngineBranches": "latest,master,cms",
             },
         )
         self.assertIn("docker:index/image:Image", mocks.resource_types)
@@ -81,6 +83,8 @@ class PulumiProgramTests(unittest.TestCase):
                 "github-oauth-worker-infra:environment": "test",
                 "gcp:project": "comic-git",
                 "github-oauth-worker-infra:firestoreDatabaseId": "test",
+                "github-oauth-worker-infra:cmsMinimumEngineVersion": "1.2",
+                "github-oauth-worker-infra:cmsAllowedEngineBranches": "latest,master,cms",
                 "github-oauth-worker-infra:serviceMode": "ready",
                 "github-oauth-worker-infra:publicBaseUrl": "https://worker.example.test",
                 "github-oauth-worker-infra:githubAppClientId": "client-id",

@@ -39,6 +39,8 @@ if pulumi.get_stack() != environment:
 
 project_id = gcp_config.require("project")
 database_id = config.require("firestoreDatabaseId")
+cms_minimum_engine_version = config.require("cmsMinimumEngineVersion")
+cms_allowed_engine_branches = config.require("cmsAllowedEngineBranches")
 expected_database_id = "test" if environment == "test" else "(default)"
 if database_id != expected_database_id:
     raise pulumi.RunError(
@@ -78,6 +80,12 @@ environment_variables = [
     ),
     gcp.cloudrunv2.ServiceTemplateContainerEnvArgs(
         name="GITHUB_LOGIN_WHITELIST", value=config.get("githubLoginWhitelist") or ""
+    ),
+    gcp.cloudrunv2.ServiceTemplateContainerEnvArgs(
+        name="CMS_MINIMUM_ENGINE_VERSION", value=cms_minimum_engine_version
+    ),
+    gcp.cloudrunv2.ServiceTemplateContainerEnvArgs(
+        name="CMS_ALLOWED_ENGINE_BRANCHES", value=cms_allowed_engine_branches
     ),
 ]
 

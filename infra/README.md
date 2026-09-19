@@ -133,6 +133,8 @@ After GitHub App registration, update the stack to `serviceMode=ready` with `pub
 `githubAppClientId`, and Pulumi secret values for the App client secret and state-signing secret.
 That update creates Secret Manager versions and injects them into the Cloud Run revision.
 
+Both normal-stack files define the CMS engine-selector policy passed to their Cloud Run revision. `cmsMinimumEngineVersion` is the lowest released `X.Y` or `X.Y.Z` engine selector the worker will accept. `cmsAllowedEngineBranches` is the comma-separated list of moving official engine branches it will accept. Keep production limited to release-quality branches such as `latest,master`; test may include controlled development branches such as `cms`.
+
 Normal local development requires no GCP credentials. Any preview or apply requires an explicit human review. CI will later provide Docker and the same short-lived GCP identity used by Pulumi.
 
 ## Optional Cost Controls
