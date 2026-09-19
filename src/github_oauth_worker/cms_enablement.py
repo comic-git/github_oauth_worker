@@ -1,6 +1,7 @@
 """Bounded engine-source, target-snapshot, and subprocess boundaries for CMS enablement."""
 
 import base64
+import configparser
 import io
 import json
 import os
@@ -8,11 +9,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from pydantic import SecretStr
 
+from github_oauth_worker.engine_resolution import EngineSelector, EngineSelectorPolicy
 from github_oauth_worker.errors import WorkerError
 from github_oauth_worker.github_client import (
     GitHubAppClient,
@@ -77,6 +80,26 @@ class RunnerMigrationPlan:
     files: tuple[MigrationPlanFile, ...]
 
 
+@dataclass(frozen=True)
+class TargetRepositoryState:
+    """Verified target revision data needed to plan a migration without a repository checkout."""
+
+    base_commit_sha: str
+    tree: GitHubGitTree
+    engine_selector: str
+
+
+@dataclass(frozen=True)
+class CmsMigrationPreview:
+    """Non-secret creator-facing migration summary produced by a fixed engine revision."""
+
+    base_commit_sha: str
+    engine_selector: str
+    engine_commit_sha: str
+    changed_paths: tuple[str, ...]
+    files: tuple[MigrationPlanFile, ...]
+
+
 def extract_official_engine_archive(archive: bytes, destination: Path) -> MaterializedEngine:
     """Extract a bounded official source archive without trusting archive paths or links."""
     if len(archive) > MAXIMUM_ARCHIVE_BYTES:
@@ -101,7 +124,7 @@ def extract_official_engine_archive(archive: bytes, destination: Path) -> Materi
                 if extracted_file is None:
                     raise CmsEnablementError
                 target.write_bytes(extracted_file.read())
-    except (OSError, tarfile.TarError):
+    except OSError, tarfile.TarError:
         raise CmsEnablementError from None
     return MaterializedEngine(extracted_root, load_engine_contract(extracted_root))
 
@@ -126,7 +149,7 @@ def load_engine_contract(engine_root: Path) -> EngineMigrationContract:
     try:
         with open(engine_root / "cms_migration_contract.json", encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError):
+    except OSError, ValueError:
         raise CmsEnablementError from None
     if not isinstance(data, dict) or data.get("protocol_version") != RUNNER_PROTOCOL_VERSION:
         raise CmsEnablementError
@@ -147,11 +170,11 @@ def load_engine_contract(engine_root: Path) -> EngineMigrationContract:
 
 
 async def materialize_target_snapshot(
-        client: GitHubAppClient,
-        user_access_token: SecretStr,
-        repository: GitHubRepository,
-        tree: GitHubGitTree,
-        destination: Path,
+    client: GitHubAppClient,
+    user_access_token: SecretStr,
+    repository: GitHubRepository,
+    tree: GitHubGitTree,
+    destination: Path,
 ) -> None:
     """Write only migration input text and inert image names from a validated Git tree."""
     if tree.truncated or len(tree.tree) > MAXIMUM_SNAPSHOT_FILES:
@@ -215,14 +238,14 @@ def decode_text_blob(blob: GitHubGitBlob) -> str:
         raise CmsEnablementError
     try:
         return base64.b64decode(blob.content, validate=True).decode("utf-8")
-    except (UnicodeDecodeError, ValueError):
+    except UnicodeDecodeError, ValueError:
         raise CmsEnablementError from None
 
 
 def run_engine_migration(
-        engine: MaterializedEngine,
-        snapshot_root: Path,
-        cms_enablement: dict[str, object],
+    engine: MaterializedEngine,
+    snapshot_root: Path,
+    cms_enablement: dict[str, object],
 ) -> RunnerMigrationPlan:
     """Run the fixed engine module with a scrubbed environment and validate its JSON output."""
     request = json.dumps(
@@ -250,7 +273,7 @@ def run_engine_migration(
                 timeout=RUNNER_TIMEOUT_SECONDS,
                 check=False,
             )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         raise CmsEnablementError from None
     if result.returncode != 0 or len(result.stdout.encode("utf-8")) > MAXIMUM_RUNNER_OUTPUT_BYTES:
         raise CmsEnablementError
@@ -282,3 +305,104 @@ def parse_runner_plan(output: str) -> RunnerMigrationPlan:
         paths.add(path)
         planned_files.append(MigrationPlanFile(path, content))
     return RunnerMigrationPlan(tuple(planned_files))
+
+
+async def read_target_repository_state(
+    client: GitHubAppClient,
+    user_access_token: SecretStr,
+    repository: GitHubRepository,
+) -> TargetRepositoryState:
+    """Read a target revision and only its main-config engine selector before source resolution."""
+    if repository.default_branch is None:
+        raise CmsEnablementError
+    ref = await client.get_repository_ref(
+        user_access_token, repository, f"heads/{repository.default_branch}"
+    )
+    if ref.object.type != "commit":
+        raise CmsEnablementError
+    commit = await client.get_repository_commit(user_access_token, repository, ref.object.sha)
+    tree = await client.get_repository_tree(user_access_token, repository, commit.tree.sha)
+    if tree.truncated:
+        raise CmsEnablementError
+    config_entry = _main_config_entry(tree)
+    blob = await client.get_repository_blob(user_access_token, repository, config_entry.sha)
+    return TargetRepositoryState(
+        base_commit_sha=commit.sha,
+        tree=tree,
+        engine_selector=parse_engine_selector(config_entry.path, decode_text_blob(blob)),
+    )
+
+
+async def build_migration_preview(
+    client: GitHubAppClient,
+    user_access_token: SecretStr,
+    repository: GitHubRepository,
+    state: TargetRepositoryState,
+    selector_policy: EngineSelectorPolicy,
+    cms_enablement: dict[str, object],
+) -> CmsMigrationPreview:
+    """Resolve approved engine code and return only its validated migration-plan summary."""
+    selector = selector_policy.select(state.engine_selector)
+    engine_commit_sha = await resolve_official_engine_commit(client, selector)
+    archive = await client.download_official_engine_archive(engine_commit_sha)
+    with tempfile.TemporaryDirectory() as workspace:
+        workspace_root = Path(workspace)
+        engine = extract_official_engine_archive(archive, workspace_root / "engine")
+        snapshot_root = workspace_root / "snapshot"
+        await materialize_target_snapshot(
+            client,
+            user_access_token,
+            repository,
+            state.tree,
+            snapshot_root,
+        )
+        plan = run_engine_migration(engine, snapshot_root, cms_enablement)
+    return CmsMigrationPreview(
+        base_commit_sha=state.base_commit_sha,
+        engine_selector=selector.value,
+        engine_commit_sha=engine_commit_sha,
+        changed_paths=tuple(file.path for file in plan.files),
+        files=plan.files,
+    )
+
+
+async def resolve_official_engine_commit(
+    client: GitHubAppClient,
+    selector: EngineSelector,
+) -> str:
+    """Resolve one approved official branch to a verified immutable commit SHA."""
+    reference = await client.resolve_official_engine_ref(selector.ref)
+    if reference.object.type != "commit":
+        raise CmsEnablementError
+    commit = await client.get_official_engine_commit(reference.object.sha)
+    return commit.sha
+
+
+def parse_engine_selector(config_path: str, contents: str) -> str:
+    """Read only the main config's engine version in the two supported config formats."""
+    try:
+        if config_path.endswith(".toml"):
+            data = tomllib.loads(contents)
+            engine = data.get("engine")
+            value = engine.get("version") if isinstance(engine, dict) else None
+        else:
+            parser = configparser.ConfigParser(interpolation=None)
+            parser.read_string(contents)
+            value = parser.get("Comic Settings", "Engine version", fallback=None)
+    except configparser.Error, tomllib.TOMLDecodeError:
+        raise CmsEnablementError from None
+    if not isinstance(value, str) or not value.strip():
+        raise CmsEnablementError
+    return value.strip()
+
+
+def _main_config_entry(tree: GitHubGitTree):
+    """Select exactly one supported main config and reject ambiguous CMS migration input."""
+    entries = [
+        entry
+        for entry in tree.tree
+        if entry.path in {"your_content/comic_info.toml", "your_content/comic_info.ini"}
+    ]
+    if len(entries) != 1 or entries[0].type != "blob" or entries[0].mode == "120000":
+        raise CmsEnablementError
+    return entries[0]

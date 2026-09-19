@@ -20,6 +20,9 @@ class OAuthFlow(StrEnum):
     DECAP = "decap"
     ENROLLMENT = "enrollment"
     SETUP = "setup"
+    CMS_ENABLEMENT_INSTALLATION = "cms_enablement_installation"
+    CMS_ENABLEMENT_REPOSITORY = "cms_enablement_repository"
+    CMS_ENABLEMENT_CONFIRMATION = "cms_enablement_confirmation"
     ORIGIN_MIGRATION = "origin_migration"
 
 
@@ -34,19 +37,44 @@ class OAuthState(BaseModel):
     target_origin: str | None = None
     repository_id: int | None = Field(default=None, gt=0)
     installation_id: int | None = Field(default=None, gt=0)
+    base_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    engine_selector: str | None = None
+    engine_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
 
     @model_validator(mode="after")
     def validate_flow_context(self) -> OAuthState:
         """Require each state flow to carry only the signed context its callback needs."""
         context = (self.origin, self.repository_id, self.installation_id)
-        if self.flow is OAuthFlow.DECAP and any(
-            value is None for value in context
-        ):
+        if self.flow is OAuthFlow.DECAP and any(value is None for value in context):
             raise ValueError("This OAuth state requires a bound origin and repository context.")
-        if self.flow is OAuthFlow.SETUP and (
-            self.origin is None or self.installation_id is None
-        ):
+        if self.flow is OAuthFlow.SETUP and (self.origin is None or self.installation_id is None):
             raise ValueError("Setup OAuth state requires an origin and installation context.")
+        if self.flow is OAuthFlow.CMS_ENABLEMENT_INSTALLATION and (
+            self.origin is not None
+            or self.repository_id is not None
+            or self.installation_id is None
+            or self.target_origin is not None
+        ):
+            raise ValueError("CMS installation state requires only an installation context.")
+        if self.flow is OAuthFlow.CMS_ENABLEMENT_REPOSITORY and (
+            self.origin is not None
+            or self.repository_id is None
+            or self.installation_id is None
+            or self.target_origin is not None
+        ):
+            raise ValueError("CMS repository state requires repository and installation contexts.")
+        if self.flow is OAuthFlow.CMS_ENABLEMENT_CONFIRMATION and (
+            self.origin is not None
+            or self.repository_id is None
+            or self.installation_id is None
+            or self.target_origin is not None
+            or self.base_commit_sha is None
+            or self.engine_selector is None
+            or self.engine_commit_sha is None
+        ):
+            raise ValueError(
+                "CMS confirmation state requires the reviewed repository and plan identity."
+            )
         if self.flow is OAuthFlow.ENROLLMENT and (
             self.origin is None
             or self.target_origin is not None
@@ -134,6 +162,40 @@ class OAuthStateManager:
         """Create setup state for an untrusted App installation pending fresh user verification."""
         return self._issue_with_context(OAuthFlow.SETUP, origin, installation_id=installation_id)
 
+    def issue_cms_enablement_installation(self, installation_id: int) -> IssuedOAuthState:
+        """Bind direct App-install setup to an installation before repository selection."""
+        return self._issue_without_origin(OAuthFlow.CMS_ENABLEMENT_INSTALLATION, installation_id)
+
+    def issue_cms_enablement_repository(
+        self,
+        repository_id: int,
+        installation_id: int,
+    ) -> IssuedOAuthState:
+        """Bind CMS migration authorization to the selected repository and App installation."""
+        return self._issue_without_origin(
+            OAuthFlow.CMS_ENABLEMENT_REPOSITORY,
+            installation_id,
+            repository_id,
+        )
+
+    def issue_cms_enablement_confirmation(
+        self,
+        repository_id: int,
+        installation_id: int,
+        base_commit_sha: str,
+        engine_selector: str,
+        engine_commit_sha: str,
+    ) -> IssuedOAuthState:
+        """Bind confirmation to the exact reviewed target revision and engine source revision."""
+        return self._issue_without_origin(
+            OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+            installation_id,
+            repository_id,
+            base_commit_sha,
+            engine_selector,
+            engine_commit_sha,
+        )
+
     def issue_origin_migration(
         self,
         source_origin: str,
@@ -176,7 +238,7 @@ class OAuthStateManager:
             state = OAuthState.model_validate(
                 self._serializer(expected_flow).loads(state_token, max_age=self._ttl_seconds)
             )
-        except (BadSignature, SignatureExpired, ValueError):
+        except BadSignature, SignatureExpired, ValueError:
             raise InvalidOAuthStateError from None
 
         is_expected_flow = state.flow == expected_flow
@@ -230,6 +292,33 @@ class OAuthStateManager:
             repository_id=repository_id,
             installation_id=installation_id,
             target_origin=target_origin,
+        )
+        token = self._serializer(flow).dumps(state.model_dump(mode="json"))
+        return IssuedOAuthState(
+            token=token,
+            cookie_name=self.correlation_cookie_name(flow),
+            correlation_nonce=correlation_nonce,
+        )
+
+    def _issue_without_origin(
+        self,
+        flow: OAuthFlow,
+        installation_id: int,
+        repository_id: int | None = None,
+        base_commit_sha: str | None = None,
+        engine_selector: str | None = None,
+        engine_commit_sha: str | None = None,
+    ) -> IssuedOAuthState:
+        """Sign a direct GitHub App setup flow that deliberately has no CMS browser origin."""
+        correlation_nonce = secrets.token_urlsafe(32)
+        state = OAuthState(
+            flow=flow,
+            nonce=correlation_nonce,
+            installation_id=installation_id,
+            repository_id=repository_id,
+            base_commit_sha=base_commit_sha,
+            engine_selector=engine_selector,
+            engine_commit_sha=engine_commit_sha,
         )
         token = self._serializer(flow).dumps(state.model_dump(mode="json"))
         return IssuedOAuthState(

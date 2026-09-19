@@ -197,11 +197,12 @@ def test_app_setup_redirect_requires_fresh_authorization_for_its_same_installati
 
     setup_page = client.get("/setup?installation_id=456")
     assert setup_page.status_code == 200
-    assert 'installation_id: 456' in setup_page.text
+    assert 'name="installation_id" value="456"' in setup_page.text
 
     setup_start = client.post(
-        "/setup/handshake",
-        json={"origin": "https://new-cms.example.com", "installation_id": 456},
+        "/setup/continue",
+        content="installation_id=456",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
         follow_redirects=False,
     )
     setup_state = parse_qs(urlparse(setup_start.headers["location"]).query)["state"][0]
@@ -209,20 +210,47 @@ def test_app_setup_redirect_requires_fresh_authorization_for_its_same_installati
 
     confirmation_page = client.get(
         f"/callback?code=one-time-code&state={setup_state}",
-        headers={"Cookie": f"oauth_correlation_setup={setup_cookie}"},
+        headers={"Cookie": f"oauth_correlation_cms_enablement_installation={setup_cookie}"},
     )
     assert confirmation_page.status_code == 200
     assert "owner/comic" in confirmation_page.text
 
-    mismatch = client.post(
-        "/enroll/select",
-        content=f"state={setup_state}&selection=457%3A123",
+    selection = client.post(
+        "/setup/select",
+        content=f"state={setup_state}&repository_id=123",
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
-            "Cookie": f"oauth_correlation_setup={setup_cookie}",
+            "Cookie": f"oauth_correlation_cms_enablement_installation={setup_cookie}",
         },
+        follow_redirects=False,
     )
-    assert mismatch.status_code == 400
+    assert selection.status_code == 302
+    assert "repository_id=123" in selection.headers["location"]
+
+
+def test_cms_setup_confirmation_requires_the_reviewed_state_cookie() -> None:
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=_FakeGitHubClient(),
+    )
+    client = TestClient(app)
+    issued = app.state.state_manager.issue_cms_enablement_confirmation(
+        123, 456, "a" * 40, "cms", "b" * 40
+    )
+
+    response = client.post(
+        "/setup/confirm",
+        content=f"state={issued.token}",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": f"{issued.cookie_name}={issued.correlation_nonce}",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert "repository_id=123" in response.headers["location"]
 
 
 def test_origin_migration_uses_the_exact_destination_handshake_before_activation() -> None:

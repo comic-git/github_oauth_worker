@@ -18,6 +18,7 @@ from github_oauth_worker.cms_enablement import (
     MaterializedEngine,
     extract_official_engine_archive,
     materialize_target_snapshot,
+    parse_engine_selector,
     parse_runner_plan,
     run_engine_migration,
 )
@@ -35,7 +36,7 @@ SHA_C = "c" * 40
 
 
 def test_extract_official_engine_archive_accepts_one_bounded_regular_file_root(
-        tmp_path: Path,
+    tmp_path: Path,
 ) -> None:
     archive = _archive(
         {
@@ -68,7 +69,7 @@ def test_extract_official_engine_archive_rejects_unsafe_paths_and_links(tmp_path
 
 
 def test_extract_official_engine_archive_rejects_unsupported_runner_dependencies(
-        tmp_path: Path,
+    tmp_path: Path,
 ) -> None:
     archive = _archive(
         {
@@ -87,7 +88,7 @@ def test_extract_official_engine_archive_rejects_unsupported_runner_dependencies
 
 
 def test_materialized_snapshot_includes_only_supported_text_and_inert_image_names(
-        tmp_path: Path,
+    tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         ini = "[Comic Info]\nName = Example\n"
@@ -176,6 +177,21 @@ def test_runner_result_allows_only_toml_changes_in_your_content() -> None:
             )
 
 
+def test_engine_selector_reads_only_the_supported_main_config_forms() -> None:
+    assert (
+        parse_engine_selector(
+            "your_content/comic_info.ini", "[Comic Settings]\nEngine version = cms"
+        )
+        == "cms"
+    )
+    assert (
+        parse_engine_selector("your_content/comic_info.toml", "[engine]\nversion = '1.2'") == "1.2"
+    )
+
+    with pytest.raises(CmsEnablementError):
+        parse_engine_selector("your_content/comic_info.toml", "[engine]\nversion = []")
+
+
 def test_runner_uses_a_scrubbed_environment_and_fixed_module(tmp_path: Path) -> None:
     engine = MaterializedEngine(
         root=tmp_path / "engine",
@@ -235,9 +251,9 @@ class _SnapshotClient:
         self._blobs = blobs
 
     async def get_repository_blob(
-            self,
-            _token: SecretStr,
-            _repository: GitHubRepository,
-            sha: str,
+        self,
+        _token: SecretStr,
+        _repository: GitHubRepository,
+        sha: str,
     ) -> GitHubGitBlob:
         return self._blobs[sha]
