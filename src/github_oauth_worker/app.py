@@ -1,5 +1,6 @@
 """FastAPI application composition for the GitHub OAuth worker."""
 
+import logging
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlencode
 
@@ -44,6 +45,7 @@ from github_oauth_worker.github_client import (
     GitHubAppClient,
     GitHubTreeChange,
 )
+from github_oauth_worker.logging import log_event
 from github_oauth_worker.policy import AccessOperation, build_access_policy
 from github_oauth_worker.state import IssuedOAuthState, OAuthFlow, OAuthState, OAuthStateManager
 
@@ -116,6 +118,7 @@ def create_app(
 ) -> FastAPI:
     """Create the worker and compose ready-mode dependencies only after settings validation."""
     worker_settings = settings or load_settings()
+    logger = logging.getLogger(__name__)
     app = FastAPI(
         title="github_oauth_worker",
         docs_url=None,
@@ -401,6 +404,21 @@ def create_app(
                     )
                 )
             except WorkerError as error:
+                log_event(
+                    logger,
+                    "oauth_callback_failed",
+                    flow=oauth_state.flow,
+                    error=error.public_message,
+                )
+                if oauth_state.flow in {
+                    OAuthFlow.CMS_ENABLEMENT_INSTALLATION,
+                    OAuthFlow.CMS_ENABLEMENT_REPOSITORY,
+                    OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+                }:
+                    return HTMLResponse(
+                        render_management_result_page(error.public_message),
+                        status_code=error.status_code,
+                    )
                 if oauth_state.flow is OAuthFlow.ORIGIN_MIGRATION:
                     return HTMLResponse(
                         render_management_result_page(error.public_message),

@@ -253,6 +253,26 @@ def test_cms_setup_confirmation_requires_the_reviewed_state_cookie() -> None:
     assert "repository_id=123" in response.headers["location"]
 
 
+def test_cms_setup_callback_renders_a_safe_error_without_a_decap_origin() -> None:
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=_FakeGitHubClient(),
+    )
+    client = TestClient(app)
+    issued = app.state.state_manager.issue_cms_enablement_confirmation(
+        123, 456, "a" * 40, "cms", "b" * 40
+    )
+
+    response = client.get(
+        f"/callback?state={issued.token}",
+        headers={"Cookie": f"{issued.cookie_name}={issued.correlation_nonce}"},
+    )
+
+    assert response.status_code == 400
+    assert "The request could not be completed." in response.text
+
+
 def test_origin_migration_uses_the_exact_destination_handshake_before_activation() -> None:
     store = InMemoryBindingStore()
     asyncio.run(
