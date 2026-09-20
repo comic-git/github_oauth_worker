@@ -6,5 +6,5 @@
 {% for repository in repositories %}
 <label><input type="radio" name="repository_id" value="{{ repository.id }}" required> {{ repository.owner.login }}/{{ repository.name }}</label><br>
 {% endfor %}
-<button type="submit">Review CMS migration</button>
+<p><button type="submit">Review CMS migration</button></p>
 </form></main></body></html>

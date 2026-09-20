@@ -1220,6 +1220,6 @@ def _cms_enablement_input(
         "repository": f"{owner}/{name}",
         "branch": target_branch,
         "backend_base_url": backend_base_url,
-        "backend_auth_endpoint": f"{backend_base_url}/auth",
+        "backend_auth_endpoint": "auth",
         "editorial_workflow": False,
     }

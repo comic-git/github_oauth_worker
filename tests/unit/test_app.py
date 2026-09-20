@@ -328,6 +328,8 @@ def test_cms_setup_review_uses_the_selected_branch_and_sets_its_confirmation_coo
         cms_enablement: dict[str, object],
     ) -> CmsMigrationPreview:
         assert cms_enablement["branch"] == "cms"
+        assert cms_enablement["backend_base_url"] == "https://worker.example.com"
+        assert cms_enablement["backend_auth_endpoint"] == "auth"
         return CmsMigrationPreview(
             base_commit_sha=state.base_commit_sha,
             target_branch=state.target_branch,
