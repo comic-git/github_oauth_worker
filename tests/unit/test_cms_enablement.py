@@ -309,6 +309,49 @@ def test_runner_uses_a_scrubbed_environment_and_fixed_module(tmp_path: Path) -> 
     assert kwargs["cwd"] != engine.root.parent
 
 
+def test_runner_failure_keeps_only_structured_safe_diagnostics(tmp_path: Path) -> None:
+    engine = MaterializedEngine(
+        root=tmp_path / "engine",
+        contract=EngineMigrationContract(1, "build.migration.runner", ("tomli-w",)),
+    )
+    runner_failure = json.dumps({"protocol_version": 1, "failure_code": "internal_error"})
+
+    with patch(
+        "github_oauth_worker.cms_enablement.subprocess.run",
+        return_value=subprocess.CompletedProcess([], 1, stdout="", stderr=runner_failure),
+    ):
+        with pytest.raises(CmsEnablementError) as raised:
+            run_engine_migration(engine, tmp_path / "snapshot", {"repository": "owner/comic"})
+
+    assert raised.value.diagnostic_code == "migration_runner_failed"
+    assert raised.value.safe_log_fields() == {
+        "runner_failure_kind": "nonzero_exit",
+        "runner_returncode": 1,
+        "runner_stdout_bytes": 0,
+        "runner_stderr_bytes": len(runner_failure.encode("utf-8")),
+        "runner_failure_code": "internal_error",
+    }
+
+
+def test_runner_failure_does_not_expose_unstructured_stderr(tmp_path: Path) -> None:
+    engine = MaterializedEngine(
+        root=tmp_path / "engine",
+        contract=EngineMigrationContract(1, "build.migration.runner", ("tomli-w",)),
+    )
+    raw_stderr = "Traceback: target file contained secret-value"
+
+    with patch(
+        "github_oauth_worker.cms_enablement.subprocess.run",
+        return_value=subprocess.CompletedProcess([], 1, stdout="", stderr=raw_stderr),
+    ):
+        with pytest.raises(CmsEnablementError) as raised:
+            run_engine_migration(engine, tmp_path / "snapshot", {"repository": "owner/comic"})
+
+    safe_fields = raised.value.safe_log_fields()
+    assert safe_fields["runner_failure_code"] == "unclassified"
+    assert "secret-value" not in repr(safe_fields)
+
+
 def _archive(files: dict[str, str | tarfile.TarInfo]) -> bytes:
     result = io.BytesIO()
     with tarfile.open(fileobj=result, mode="w:gz") as archive:

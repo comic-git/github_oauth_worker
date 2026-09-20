@@ -476,6 +476,7 @@ def create_app(
                     diagnostic_code=error.diagnostic_code,
                     status_code=error.status_code,
                     public_message=error.public_message,
+                    **error.safe_log_fields(),
                 )
                 if oauth_state.flow in _CMS_ENABLEMENT_FLOWS:
                     return HTMLResponse(

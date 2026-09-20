@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -34,12 +35,14 @@ MAXIMUM_SNAPSHOT_FILES = 10_000
 MAXIMUM_SNAPSHOT_TEXT_BYTES = 10 * 1024 * 1024
 MAXIMUM_SNAPSHOT_TEXT_FILE_BYTES = 1 * 1024 * 1024
 MAXIMUM_RUNNER_OUTPUT_BYTES = 10 * 1024 * 1024
+MAXIMUM_RUNNER_FAILURE_BYTES = 4 * 1024
 RUNNER_TIMEOUT_SECONDS = 30
 TEXT_SOURCE_SUFFIXES = frozenset({".ini", ".toml", ".txt", ".md", ".json"})
 IMAGE_SUFFIXES = frozenset(
     {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".gif", ".bmp", ".webp", ".webv", ".svg", ".eps"}
 )
 SUPPORTED_RUNNER_RUNTIME_PACKAGES = frozenset({"tomli-w"})
+RUNNER_FAILURE_CODES = frozenset({"request_invalid", "internal_error"})
 
 
 class CmsEnablementError(WorkerError):
@@ -78,10 +81,19 @@ class CmsEnablementError(WorkerError):
     diagnostic_code = "cms_enablement_failed"
     public_message = "This repository cannot be prepared for CMS enablement by this worker."
 
-    def __init__(self, diagnostic_code: str = "cms_enablement_failed") -> None:
+    def __init__(
+            self,
+            diagnostic_code: str = "cms_enablement_failed",
+            *,
+            safe_log_fields: Mapping[str, object] | None = None,
+    ) -> None:
         """Map an internal boundary category to a safe troubleshooting response."""
         self.diagnostic_code = diagnostic_code
         self.public_message = self._PUBLIC_MESSAGES.get(diagnostic_code, type(self).public_message)
+        self._safe_log_fields = dict(safe_log_fields or {})
+
+    def safe_log_fields(self) -> dict[str, object]:
+        return dict(self._safe_log_fields)
 
 
 @dataclass(frozen=True)
@@ -314,11 +326,60 @@ def run_engine_migration(
                 timeout=RUNNER_TIMEOUT_SECONDS,
                 check=False,
             )
-    except OSError, subprocess.TimeoutExpired:
-        raise CmsEnablementError("migration_runner_failed") from None
-    if result.returncode != 0 or len(result.stdout.encode("utf-8")) > MAXIMUM_RUNNER_OUTPUT_BYTES:
-        raise CmsEnablementError("migration_runner_failed")
+    except OSError:
+        raise CmsEnablementError(
+            "migration_runner_failed",
+            safe_log_fields={"runner_failure_kind": "spawn_failed"},
+        ) from None
+    except subprocess.TimeoutExpired:
+        raise CmsEnablementError(
+            "migration_runner_failed",
+            safe_log_fields={"runner_failure_kind": "timeout"},
+        ) from None
+    stdout_bytes = len(result.stdout.encode("utf-8"))
+    if result.returncode != 0:
+        raise CmsEnablementError(
+            "migration_runner_failed",
+            safe_log_fields=runner_failure_log_fields(result, "nonzero_exit", stdout_bytes),
+        )
+    if stdout_bytes > MAXIMUM_RUNNER_OUTPUT_BYTES:
+        raise CmsEnablementError(
+            "migration_runner_failed",
+            safe_log_fields=runner_failure_log_fields(result, "output_too_large", stdout_bytes),
+        )
     return parse_runner_plan(result.stdout)
+
+
+def runner_failure_log_fields(
+        result: subprocess.CompletedProcess[str],
+        failure_kind: str,
+        stdout_bytes: int,
+) -> dict[str, object]:
+    """Return bounded runner diagnostics without retaining target-derived stderr text."""
+    return {
+        "runner_failure_kind": failure_kind,
+        "runner_returncode": result.returncode,
+        "runner_stdout_bytes": stdout_bytes,
+        "runner_stderr_bytes": len(result.stderr.encode("utf-8")),
+        "runner_failure_code": parse_runner_failure_code(result.stderr),
+    }
+
+
+def parse_runner_failure_code(stderr: str) -> str:
+    """Accept only the engine's small fixed failure protocol, never free-form runner output."""
+    if len(stderr.encode("utf-8")) > MAXIMUM_RUNNER_FAILURE_BYTES:
+        return "unclassified"
+    try:
+        data = json.loads(stderr)
+    except ValueError:
+        return "unclassified"
+    if (
+        isinstance(data, dict)
+        and data.get("protocol_version") == RUNNER_PROTOCOL_VERSION
+        and data.get("failure_code") in RUNNER_FAILURE_CODES
+    ):
+        return data["failure_code"]
+    return "unclassified"
 
 
 def parse_runner_plan(output: str) -> RunnerMigrationPlan:

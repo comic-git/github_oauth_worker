@@ -392,6 +392,41 @@ def test_cms_branch_callback_returns_a_safe_page_for_a_migration_error(monkeypat
     assert "Internal Server Error" not in response.text
 
 
+def test_cms_branch_callback_logs_safe_migration_diagnostics(monkeypatch) -> None:
+    async def fail_target_state(*_args: object) -> TargetRepositoryState:
+        raise CmsEnablementError(
+            "migration_runner_failed",
+            safe_log_fields={"runner_failure_kind": "nonzero_exit", "runner_returncode": 1},
+        )
+
+    logged_fields: dict[str, object] = {}
+
+    def capture_log_event(*args: object, **fields: object) -> None:
+        if len(args) > 1 and args[1] == "oauth_callback_failed":
+            logged_fields["event"] = args[1]
+            logged_fields.update(fields)
+
+    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", fail_target_state)
+    monkeypatch.setattr("github_oauth_worker.app.log_event", capture_log_event)
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=_FakeGitHubClient(),
+    )
+    client = TestClient(app)
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+
+    response = client.get(
+        f"/callback?code=one-time-code&state={issued_state.token}",
+        headers={"Cookie": f"{issued_state.cookie_name}={issued_state.correlation_nonce}"},
+    )
+
+    assert response.status_code == 400
+    assert logged_fields["event"] == "oauth_callback_failed"
+    assert logged_fields["runner_failure_kind"] == "nonzero_exit"
+    assert logged_fields["runner_returncode"] == 1
+
+
 def test_cms_branch_callback_hides_an_unexpected_error_without_a_traceback(monkeypatch) -> None:
     async def fail_target_state(*_args: object) -> TargetRepositoryState:
         raise RuntimeError("sensitive unexpected detail")

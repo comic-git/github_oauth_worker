@@ -8,6 +8,10 @@ class WorkerError(Exception):
     diagnostic_code = "request_failed"
     public_message = "The request could not be completed."
 
+    def safe_log_fields(self) -> dict[str, object]:
+        """Return diagnostic metadata that is explicitly safe to send to structured logs."""
+        return {}
+
 
 class WorkerUnavailableError(WorkerError):
     """Report an unavailable worker without revealing deployment configuration."""
