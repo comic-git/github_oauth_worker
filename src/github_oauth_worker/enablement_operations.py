@@ -1,6 +1,7 @@
 """Non-secret, idempotent persistence for CMS enablement pull-request operations."""
 
 import asyncio
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -38,6 +39,7 @@ class EnablementOperation(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     repository_id: int = Field(gt=0)
+    target_branch: str = Field(min_length=1)
     base_commit_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     engine_selector: str = Field(min_length=1)
     engine_commit_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
@@ -67,6 +69,7 @@ class EnablementOperation(BaseModel):
         cls,
         *,
         repository_id: int,
+        target_branch: str,
         base_commit_sha: str,
         engine_selector: str,
         engine_commit_sha: str,
@@ -77,6 +80,7 @@ class EnablementOperation(BaseModel):
         timestamp = now or datetime.now(UTC)
         return cls(
             repository_id=repository_id,
+            target_branch=target_branch,
             base_commit_sha=base_commit_sha,
             engine_selector=engine_selector,
             engine_commit_sha=engine_commit_sha,
@@ -100,17 +104,20 @@ class EnablementOperationStore(Protocol):
     async def put_planned(self, operation: EnablementOperation) -> EnablementOperation:
         """Create or refresh a non-writing plan for one repository and base revision."""
 
-    async def get(self, repository_id: int, base_commit_sha: str) -> EnablementOperation | None:
-        """Return the record for one immutable repository revision."""
+    async def get(
+        self, repository_id: int, target_branch: str, base_commit_sha: str
+    ) -> EnablementOperation | None:
+        """Return the record for one immutable revision on one selected target branch."""
 
     async def claim_writing(
-        self, repository_id: int, base_commit_sha: str
+        self, repository_id: int, target_branch: str, base_commit_sha: str
     ) -> EnablementOperationClaim:
         """Atomically acquire the one permitted GitHub write attempt for a plan."""
 
     async def complete(
         self,
         repository_id: int,
+        target_branch: str,
         base_commit_sha: str,
         pull_request_number: int,
         pull_request_url: str,
@@ -128,7 +135,9 @@ class InMemoryEnablementOperationStore(EnablementOperationStore):
 
     async def put_planned(self, operation: EnablementOperation) -> EnablementOperation:
         async with self._lock:
-            key = operation_document_id(operation.repository_id, operation.base_commit_sha)
+            key = operation_document_id(
+                operation.repository_id, operation.target_branch, operation.base_commit_sha
+            )
             existing = self._operations.get(key)
             if existing is not None and existing.status is not EnablementOperationStatus.PLANNED:
                 return existing
@@ -137,15 +146,19 @@ class InMemoryEnablementOperationStore(EnablementOperationStore):
             self._operations[key] = operation
             return operation
 
-    async def get(self, repository_id: int, base_commit_sha: str) -> EnablementOperation | None:
+    async def get(
+        self, repository_id: int, target_branch: str, base_commit_sha: str
+    ) -> EnablementOperation | None:
         async with self._lock:
-            return self._operations.get(operation_document_id(repository_id, base_commit_sha))
+            return self._operations.get(
+                operation_document_id(repository_id, target_branch, base_commit_sha)
+            )
 
     async def claim_writing(
-        self, repository_id: int, base_commit_sha: str
+        self, repository_id: int, target_branch: str, base_commit_sha: str
     ) -> EnablementOperationClaim:
         async with self._lock:
-            key = operation_document_id(repository_id, base_commit_sha)
+            key = operation_document_id(repository_id, target_branch, base_commit_sha)
             operation = self._operations.get(key)
             if operation is None:
                 raise EnablementOperationConflictError
@@ -160,12 +173,13 @@ class InMemoryEnablementOperationStore(EnablementOperationStore):
     async def complete(
         self,
         repository_id: int,
+        target_branch: str,
         base_commit_sha: str,
         pull_request_number: int,
         pull_request_url: str,
     ) -> EnablementOperation:
         async with self._lock:
-            key = operation_document_id(repository_id, base_commit_sha)
+            key = operation_document_id(repository_id, target_branch, base_commit_sha)
             operation = self._operations.get(key)
             if operation is None:
                 raise EnablementOperationConflictError
@@ -200,7 +214,9 @@ class FirestoreEnablementOperationStore(EnablementOperationStore):
         return cls(AsyncClient(project=firestore.project_id, database=firestore.database_id))
 
     async def put_planned(self, operation: EnablementOperation) -> EnablementOperation:
-        reference = self._reference(operation.repository_id, operation.base_commit_sha)
+        reference = self._reference(
+            operation.repository_id, operation.target_branch, operation.base_commit_sha
+        )
 
         @async_transactional
         async def write(transaction: object) -> EnablementOperation:
@@ -219,14 +235,16 @@ class FirestoreEnablementOperationStore(EnablementOperationStore):
 
         return await write(self._client.transaction())
 
-    async def get(self, repository_id: int, base_commit_sha: str) -> EnablementOperation | None:
-        snapshot = await self._reference(repository_id, base_commit_sha).get()
+    async def get(
+        self, repository_id: int, target_branch: str, base_commit_sha: str
+    ) -> EnablementOperation | None:
+        snapshot = await self._reference(repository_id, target_branch, base_commit_sha).get()
         return self._from_snapshot(snapshot) if snapshot.exists else None
 
     async def claim_writing(
-        self, repository_id: int, base_commit_sha: str
+        self, repository_id: int, target_branch: str, base_commit_sha: str
     ) -> EnablementOperationClaim:
-        reference = self._reference(repository_id, base_commit_sha)
+        reference = self._reference(repository_id, target_branch, base_commit_sha)
 
         @async_transactional
         async def write(transaction: object) -> EnablementOperationClaim:
@@ -247,11 +265,12 @@ class FirestoreEnablementOperationStore(EnablementOperationStore):
     async def complete(
         self,
         repository_id: int,
+        target_branch: str,
         base_commit_sha: str,
         pull_request_number: int,
         pull_request_url: str,
     ) -> EnablementOperation:
-        reference = self._reference(repository_id, base_commit_sha)
+        reference = self._reference(repository_id, target_branch, base_commit_sha)
 
         @async_transactional
         async def write(transaction: object) -> EnablementOperation:
@@ -276,9 +295,9 @@ class FirestoreEnablementOperationStore(EnablementOperationStore):
 
         return await write(self._client.transaction())
 
-    def _reference(self, repository_id: int, base_commit_sha: str) -> object:
+    def _reference(self, repository_id: int, target_branch: str, base_commit_sha: str) -> object:
         return self._client.collection(self._COLLECTION).document(
-            operation_document_id(repository_id, base_commit_sha)
+            operation_document_id(repository_id, target_branch, base_commit_sha)
         )
 
     @staticmethod
@@ -289,14 +308,23 @@ class FirestoreEnablementOperationStore(EnablementOperationStore):
             raise EnablementOperationStoreError from None
 
 
-def operation_document_id(repository_id: int, base_commit_sha: str) -> str:
-    """Create a direct Firestore-safe key from immutable identifiers without repository content."""
+def operation_document_id(repository_id: int, target_branch: str, base_commit_sha: str) -> str:
+    """Create a Firestore-safe operation key without treating a branch slash as a path."""
     if (
         repository_id <= 0
+        or not target_branch
         or len(base_commit_sha) != 40
         or any(c not in "0123456789abcdef" for c in base_commit_sha)
     ):
         raise ValueError(
-            "Operation keys require a positive repository ID and lowercase commit SHA."
+            "Operation keys require a positive repository ID, target branch, and lowercase "
+            "commit SHA."
         )
-    return f"{repository_id}-{base_commit_sha}"
+    branch_digest = hashlib.sha256(target_branch.encode("utf-8")).hexdigest()
+    return f"{repository_id}-{branch_digest}-{base_commit_sha}"
+
+
+def migration_branch_name(target_branch: str, base_commit_sha: str) -> str:
+    """Derive a concise worker branch name from the selected target branch and immutable base."""
+    identity = f"{target_branch}\0{base_commit_sha}".encode()
+    return f"comic-git/cms-enable/{hashlib.sha256(identity).hexdigest()[:12]}"

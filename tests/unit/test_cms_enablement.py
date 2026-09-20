@@ -21,10 +21,15 @@ from github_oauth_worker.cms_enablement import (
     materialize_target_snapshot,
     parse_engine_selector,
     parse_runner_plan,
+    read_target_repository_state,
     run_engine_migration,
 )
 from github_oauth_worker.github_client import (
     GitHubGitBlob,
+    GitHubGitCommit,
+    GitHubGitObject,
+    GitHubGitReference,
+    GitHubGitSha,
     GitHubGitTree,
     GitHubGitTreeEntry,
     GitHubRepository,
@@ -105,6 +110,12 @@ def test_materialized_snapshot_includes_only_supported_text_and_inert_image_name
         tree = GitHubGitTree(
             sha=SHA_B,
             tree=(
+                GitHubGitTreeEntry(
+                    path="your_content/comics",
+                    mode="040000",
+                    type="tree",
+                    sha=SHA_C,
+                ),
                 _entry("your_content/comic_info.ini", SHA_A, len(ini.encode())),
                 _entry("your_content/comics/page/image.jpg", SHA_C, 9),
                 _entry("README.md", SHA_C, 9),
@@ -209,6 +220,66 @@ def test_decode_text_blob_accepts_github_style_multiline_base64() -> None:
     )
 
     assert decode_text_blob(blob) == source
+
+
+def test_target_state_reads_the_creator_selected_branch() -> None:
+    class TargetStateClient:
+        def __init__(self) -> None:
+            self.requested_ref: str | None = None
+
+        async def get_repository_ref(
+            self,
+            _token: SecretStr,
+            _repository: GitHubRepository,
+            ref: str,
+        ) -> GitHubGitReference:
+            self.requested_ref = ref
+            return GitHubGitReference(
+                ref="refs/heads/cms",
+                object=GitHubGitObject(type="commit", sha=SHA_A),
+            )
+
+        async def get_repository_commit(
+            self,
+            _token: SecretStr,
+            _repository: GitHubRepository,
+            _sha: str,
+        ) -> GitHubGitCommit:
+            return GitHubGitCommit(sha=SHA_A, tree=GitHubGitSha(sha=SHA_B))
+
+        async def get_repository_tree(
+            self,
+            _token: SecretStr,
+            _repository: GitHubRepository,
+            _sha: str,
+        ) -> GitHubGitTree:
+            return GitHubGitTree(
+                sha=SHA_B,
+                tree=(_entry("your_content/comic_info.ini", SHA_C, 38),),
+            )
+
+        async def get_repository_blob(
+            self,
+            _token: SecretStr,
+            _repository: GitHubRepository,
+            _sha: str,
+        ) -> GitHubGitBlob:
+            source = "[Comic Settings]\nEngine version = cms\n"
+            return GitHubGitBlob(
+                sha=SHA_C,
+                encoding="base64",
+                content=base64.b64encode(source.encode()).decode(),
+            )
+
+    async def scenario() -> None:
+        client = TargetStateClient()
+        state = await read_target_repository_state(client, SecretStr("token"), _repository(), "cms")
+
+        assert client.requested_ref == "heads/cms"
+        assert state.target_branch == "cms"
+        assert state.engine_selector == "cms"
+
+    asyncio.run(scenario())
 
 
 def test_runner_uses_a_scrubbed_environment_and_fixed_module(tmp_path: Path) -> None:

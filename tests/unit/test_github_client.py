@@ -133,6 +133,33 @@ def test_list_repositories_uses_bounded_pagination() -> None:
     asyncio.run(scenario())
 
 
+def test_list_repository_branches_uses_bounded_pagination() -> None:
+    async def scenario() -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.params["page"] == "1":
+                return httpx.Response(
+                    200,
+                    json=[{"name": f"branch-{index}"} for index in range(100)],
+                )
+            return httpx.Response(200, json=[{"name": "cms"}])
+
+        client = _client(handler)
+        branches = await client.list_repository_branches(
+            SecretStr("user-access-token"), _repository()
+        )
+
+        assert [branch.name for branch in branches] == [
+            *[f"branch-{index}" for index in range(100)],
+            "cms",
+        ]
+        assert [request.url.params["page"] for request in requests] == ["1", "2"]
+
+    asyncio.run(scenario())
+
+
 def test_cms_enablement_reads_require_administrator_permission() -> None:
     async def scenario() -> None:
         repository = _repository()

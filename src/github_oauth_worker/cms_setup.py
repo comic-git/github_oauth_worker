@@ -1,7 +1,7 @@
 """Creator-facing pages for direct GitHub App CMS enablement setup."""
 
 from github_oauth_worker.cms_enablement import CmsMigrationPreview
-from github_oauth_worker.github_client import GitHubRepository
+from github_oauth_worker.github_client import GitHubRepository, GitHubRepositoryBranch
 from github_oauth_worker.html_templates import render_template
 
 
@@ -21,6 +21,20 @@ def render_cms_repository_selection_page(
         state_token=state_token,
         installation_id=installation_id,
         repositories=repositories,
+    )
+
+
+def render_cms_branch_selection_page(
+    state_token: str,
+    repository: GitHubRepository,
+    branches: tuple[GitHubRepositoryBranch, ...],
+) -> str:
+    """Render branches GitHub exposed after the creator's repository access was reverified."""
+    return render_template(
+        "cms_setup_branch_selection.tpl",
+        state_token=state_token,
+        repository=repository,
+        branches=branches,
     )
 
 

@@ -22,6 +22,7 @@ class OAuthFlow(StrEnum):
     SETUP = "setup"
     CMS_ENABLEMENT_INSTALLATION = "cms_enablement_installation"
     CMS_ENABLEMENT_REPOSITORY = "cms_enablement_repository"
+    CMS_ENABLEMENT_BRANCH = "cms_enablement_branch"
     CMS_ENABLEMENT_CONFIRMATION = "cms_enablement_confirmation"
     ORIGIN_MIGRATION = "origin_migration"
 
@@ -37,6 +38,7 @@ class OAuthState(BaseModel):
     target_origin: str | None = None
     repository_id: int | None = Field(default=None, gt=0)
     installation_id: int | None = Field(default=None, gt=0)
+    target_branch: str | None = Field(default=None, min_length=1)
     base_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     engine_selector: str | None = None
     engine_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
@@ -54,6 +56,7 @@ class OAuthState(BaseModel):
             or self.repository_id is not None
             or self.installation_id is None
             or self.target_origin is not None
+            or self.target_branch is not None
         ):
             raise ValueError("CMS installation state requires only an installation context.")
         if self.flow is OAuthFlow.CMS_ENABLEMENT_REPOSITORY and (
@@ -61,13 +64,25 @@ class OAuthState(BaseModel):
             or self.repository_id is None
             or self.installation_id is None
             or self.target_origin is not None
+            or self.target_branch is not None
         ):
             raise ValueError("CMS repository state requires repository and installation contexts.")
+        if self.flow is OAuthFlow.CMS_ENABLEMENT_BRANCH and (
+            self.origin is not None
+            or self.repository_id is None
+            or self.installation_id is None
+            or self.target_origin is not None
+            or self.target_branch is None
+        ):
+            raise ValueError(
+                "CMS branch state requires repository, installation, and branch contexts."
+            )
         if self.flow is OAuthFlow.CMS_ENABLEMENT_CONFIRMATION and (
             self.origin is not None
             or self.repository_id is None
             or self.installation_id is None
             or self.target_origin is not None
+            or self.target_branch is None
             or self.base_commit_sha is None
             or self.engine_selector is None
             or self.engine_commit_sha is None
@@ -88,6 +103,11 @@ class OAuthState(BaseModel):
             raise ValueError("Origin-migration OAuth state requires source and target contexts.")
         if self.flow in (OAuthFlow.DECAP, OAuthFlow.SETUP) and self.target_origin is not None:
             raise ValueError("Only origin-migration state may contain a target origin.")
+        if self.flow not in (
+            OAuthFlow.CMS_ENABLEMENT_BRANCH,
+            OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+        ) and self.target_branch is not None:
+            raise ValueError("Only branch-bound CMS states may contain a target branch.")
         return self
 
 
@@ -182,6 +202,7 @@ class OAuthStateManager:
         self,
         repository_id: int,
         installation_id: int,
+        target_branch: str,
         base_commit_sha: str,
         engine_selector: str,
         engine_commit_sha: str,
@@ -191,9 +212,24 @@ class OAuthStateManager:
             OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
             installation_id,
             repository_id,
-            base_commit_sha,
-            engine_selector,
-            engine_commit_sha,
+            target_branch=target_branch,
+            base_commit_sha=base_commit_sha,
+            engine_selector=engine_selector,
+            engine_commit_sha=engine_commit_sha,
+        )
+
+    def issue_cms_enablement_branch(
+        self,
+        repository_id: int,
+        installation_id: int,
+        target_branch: str,
+    ) -> IssuedOAuthState:
+        """Bind fresh CMS migration planning authorization to the creator-selected branch."""
+        return self._issue_without_origin(
+            OAuthFlow.CMS_ENABLEMENT_BRANCH,
+            installation_id,
+            repository_id,
+            target_branch=target_branch,
         )
 
     def issue_origin_migration(
@@ -305,6 +341,7 @@ class OAuthStateManager:
         flow: OAuthFlow,
         installation_id: int,
         repository_id: int | None = None,
+        target_branch: str | None = None,
         base_commit_sha: str | None = None,
         engine_selector: str | None = None,
         engine_commit_sha: str | None = None,
@@ -316,6 +353,7 @@ class OAuthStateManager:
             nonce=correlation_nonce,
             installation_id=installation_id,
             repository_id=repository_id,
+            target_branch=target_branch,
             base_commit_sha=base_commit_sha,
             engine_selector=engine_selector,
             engine_commit_sha=engine_commit_sha,

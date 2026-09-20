@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
@@ -9,15 +10,23 @@ from pydantic import SecretStr
 
 from github_oauth_worker.app import create_app
 from github_oauth_worker.bindings import BindingStatus, InMemoryBindingStore, RepositoryBinding
+from github_oauth_worker.cms_enablement import (
+    CmsEnablementError,
+    CmsMigrationPreview,
+    TargetRepositoryState,
+)
 from github_oauth_worker.config import AccessPolicyMode, ServiceMode, WorkerSettings
 from github_oauth_worker.errors import WorkerUnavailableError
 from github_oauth_worker.github_client import (
     GitHubAccessVerificationError,
+    GitHubGitTree,
     GitHubRepository,
+    GitHubRepositoryBranch,
     GitHubRepositoryOwner,
     GitHubUser,
     GitHubUserAccessToken,
 )
+from github_oauth_worker.state import OAuthFlow
 
 
 def test_health_reports_bootstrap_without_configuration() -> None:
@@ -236,6 +245,32 @@ def test_app_setup_redirect_requires_fresh_authorization_for_its_same_installati
     assert selection.status_code == 302
     assert "repository_id=123" in selection.headers["location"]
 
+    repository_state = parse_qs(urlparse(selection.headers["location"]).query)["state"][0]
+    repository_cookie = selection.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+    branch_page = client.get(
+        f"/callback?code=one-time-code&state={repository_state}",
+        headers={"Cookie": f"oauth_correlation_cms_enablement_repository={repository_cookie}"},
+    )
+    assert branch_page.status_code == 200
+    assert "Select comic branch" in branch_page.text
+    assert '<option value="main" selected>' in branch_page.text
+    assert '<option value="cms">' in branch_page.text
+
+    branch_state = re.search('name="state" value="([^"]+)"', branch_page.text)
+    assert branch_state is not None
+    branch_cookie = branch_page.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+    branch_selection = client.post(
+        "/setup/select-branch",
+        content=f"state={branch_state.group(1)}&target_branch=cms",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": f"oauth_correlation_cms_enablement_repository={branch_cookie}",
+        },
+        follow_redirects=False,
+    )
+    assert branch_selection.status_code == 302
+    assert "repository_id=123" in branch_selection.headers["location"]
+
 
 def test_cms_setup_confirmation_requires_the_reviewed_state_cookie() -> None:
     app = create_app(
@@ -245,7 +280,7 @@ def test_cms_setup_confirmation_requires_the_reviewed_state_cookie() -> None:
     )
     client = TestClient(app)
     issued = app.state.state_manager.issue_cms_enablement_confirmation(
-        123, 456, "a" * 40, "cms", "b" * 40
+        123, 456, "master", "a" * 40, "cms", "b" * 40
     )
 
     response = client.post(
@@ -262,6 +297,125 @@ def test_cms_setup_confirmation_requires_the_reviewed_state_cookie() -> None:
     assert "repository_id=123" in response.headers["location"]
 
 
+def test_cms_setup_review_uses_the_selected_branch_and_sets_its_confirmation_cookie(
+    monkeypatch,
+) -> None:
+    async def read_target_state(
+        _github_client: object,
+        _user_access_token: SecretStr,
+        _repository: GitHubRepository,
+        target_branch: str,
+    ) -> TargetRepositoryState:
+        assert target_branch == "cms"
+        return TargetRepositoryState(
+            base_commit_sha="a" * 40,
+            target_branch=target_branch,
+            tree=GitHubGitTree(sha="b" * 40, tree=()),
+            config_path="your_content/comic_info.toml",
+            engine_selector="cms",
+        )
+
+    async def resolve_engine_commit(_github_client: object, _selector: object) -> str:
+        return "c" * 40
+
+    async def build_preview(
+        _github_client: object,
+        _user_access_token: SecretStr,
+        _repository: GitHubRepository,
+        state: TargetRepositoryState,
+        _selector: object,
+        engine_commit_sha: str,
+        cms_enablement: dict[str, object],
+    ) -> CmsMigrationPreview:
+        assert cms_enablement["branch"] == "cms"
+        return CmsMigrationPreview(
+            base_commit_sha=state.base_commit_sha,
+            target_branch=state.target_branch,
+            engine_selector=state.engine_selector,
+            engine_commit_sha=engine_commit_sha,
+            changed_paths=("your_content/comic_info.toml",),
+            files=(),
+        )
+
+    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_target_state)
+    monkeypatch.setattr(
+        "github_oauth_worker.app.resolve_official_engine_commit", resolve_engine_commit
+    )
+    monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=_FakeGitHubClient(),
+    )
+    client = TestClient(app)
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+
+    response = client.get(
+        f"/callback?code=one-time-code&state={issued_state.token}",
+        headers={"Cookie": f"{issued_state.cookie_name}={issued_state.correlation_nonce}"},
+    )
+
+    assert response.status_code == 200
+    assert "Target branch: cms" in response.text
+    confirmation_state = re.search('name="state" value="([^"]+)"', response.text)
+    assert confirmation_state is not None
+    confirmation_cookie = response.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+    confirmed = app.state.state_manager.consume(
+        confirmation_state.group(1),
+        confirmation_cookie,
+        expected_flow=OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+    )
+    assert confirmed.target_branch == "cms"
+
+
+def test_cms_branch_callback_returns_a_safe_page_for_a_migration_error(monkeypatch) -> None:
+    async def fail_target_state(*_args: object) -> TargetRepositoryState:
+        raise CmsEnablementError("target_content_invalid")
+
+    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", fail_target_state)
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=_FakeGitHubClient(),
+    )
+    client = TestClient(app)
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+
+    response = client.get(
+        f"/callback?code=one-time-code&state={issued_state.token}",
+        headers={"Cookie": f"{issued_state.cookie_name}={issued_state.correlation_nonce}"},
+    )
+
+    assert response.status_code == 400
+    assert "comic_git CMS setup could not continue" in response.text
+    assert "target_content_invalid" in response.text
+    assert "Internal Server Error" not in response.text
+
+
+def test_cms_branch_callback_hides_an_unexpected_error_without_a_traceback(monkeypatch) -> None:
+    async def fail_target_state(*_args: object) -> TargetRepositoryState:
+        raise RuntimeError("sensitive unexpected detail")
+
+    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", fail_target_state)
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=_FakeGitHubClient(),
+    )
+    client = TestClient(app)
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+
+    response = client.get(
+        f"/callback?code=one-time-code&state={issued_state.token}",
+        headers={"Cookie": f"{issued_state.cookie_name}={issued_state.correlation_nonce}"},
+    )
+
+    assert response.status_code == 500
+    assert "comic_git CMS setup could not continue" in response.text
+    assert "unexpected_callback_failure" in response.text
+    assert "sensitive unexpected detail" not in response.text
+
+
 def test_cms_setup_callback_renders_a_safe_error_without_a_decap_origin() -> None:
     app = create_app(
         _ready_settings(),
@@ -270,7 +424,7 @@ def test_cms_setup_callback_renders_a_safe_error_without_a_decap_origin() -> Non
     )
     client = TestClient(app)
     issued = app.state.state_manager.issue_cms_enablement_confirmation(
-        123, 456, "a" * 40, "cms", "b" * 40
+        123, 456, "master", "a" * 40, "cms", "b" * 40
     )
 
     response = client.get(
@@ -371,6 +525,7 @@ def _ready_settings() -> WorkerSettings:
         github_app_client_secret="client-secret",
         state_signing_secret="state-secret",
         access_policy=AccessPolicyMode.PUBLIC,
+        cms_allowed_engine_branches=frozenset({"cms", "latest", "master"}),
     )
 
 
@@ -449,7 +604,27 @@ class _FakeGitHubClient:
             id=123,
             name="comic",
             owner=GitHubRepositoryOwner(login="owner"),
+            default_branch="main",
         )
+
+    async def require_repository_administrator(
+        self,
+        user_access_token: SecretStr,
+        repository: GitHubRepository,
+        login: str,
+    ) -> None:
+        assert user_access_token.get_secret_value() == "access-token"
+        assert repository.id == 123
+        assert login == "marco"
+
+    async def list_repository_branches(
+        self,
+        user_access_token: SecretStr,
+        repository: GitHubRepository,
+    ) -> tuple[GitHubRepositoryBranch, ...]:
+        assert user_access_token.get_secret_value() == "access-token"
+        assert repository.id == 123
+        return (GitHubRepositoryBranch(name="cms"), GitHubRepositoryBranch(name="main"))
 
 
 class _FakeInstallation:

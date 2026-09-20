@@ -38,7 +38,7 @@ Repository IDs, not owner/name strings, are binding identities. Renames only ref
 
 ## CMS Enablement
 
-The planned first-run setup flow converts a legacy comic_git repository to CMS-ready TOML and creates a pull request for the creator to review and merge. The worker never interprets comic content itself: it invokes a pinned comic_git_engine migration library against a temporary workspace populated from verified GitHub repository data. The worker does not clone or execute repository code. A generated pull request retains legacy files, adds TOML and CMS configuration, and records the exact resolved engine SHA without changing the repository's configured engine version or submodule revision.
+The planned first-run setup flow converts a legacy comic_git repository to CMS-ready TOML and creates a pull request for the creator to review and merge. After selecting a repository, the creator chooses an accessible branch; the repository default is preselected. The worker revalidates that branch before preview and confirmation, uses it for all migration reads and writes, and targets the pull request at it. The worker never interprets comic content itself: it invokes a pinned comic_git_engine migration library against a temporary workspace populated from verified GitHub repository data. The worker does not clone or execute repository code. A generated pull request retains legacy files, adds TOML and CMS configuration, and records the exact resolved engine SHA without changing the repository's configured engine version or submodule revision.
 
 ## External Boundaries
 

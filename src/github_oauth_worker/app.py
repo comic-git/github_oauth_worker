@@ -1,5 +1,6 @@
 """FastAPI application composition for the GitHub OAuth worker."""
 
+import logging
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlencode
 
@@ -22,6 +23,7 @@ from github_oauth_worker.cms_enablement import (
     resolve_official_engine_commit,
 )
 from github_oauth_worker.cms_setup import (
+    render_cms_branch_selection_page,
     render_cms_migration_result_page,
     render_cms_migration_summary_page,
     render_cms_repository_selection_page,
@@ -41,6 +43,7 @@ from github_oauth_worker.enablement_operations import (
     EnablementOperation,
     EnablementOperationStore,
     FirestoreEnablementOperationStore,
+    migration_branch_name,
 )
 from github_oauth_worker.engine_resolution import EngineSelectorError, EngineSelectorPolicy
 from github_oauth_worker.enrollment import render_enrollment_confirmation_page
@@ -107,6 +110,15 @@ class CmsSetupConfirmationRequest(BaseModel):
     state: str
 
 
+class CmsSetupBranchSelectionRequest(BaseModel):
+    """A signed repository-selection state and the branch chosen from GitHub's verified list."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: str
+    target_branch: str
+
+
 class OriginMigrationHandshakeRequest(BaseModel):
     """A current browser origin and desired destination captured by the migration popup."""
 
@@ -114,6 +126,16 @@ class OriginMigrationHandshakeRequest(BaseModel):
 
     origin: str
     target_origin: str
+
+
+_CMS_ENABLEMENT_FLOWS = frozenset(
+    {
+        OAuthFlow.CMS_ENABLEMENT_INSTALLATION,
+        OAuthFlow.CMS_ENABLEMENT_REPOSITORY,
+        OAuthFlow.CMS_ENABLEMENT_BRANCH,
+        OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+    }
+)
 
 
 def create_app(
@@ -250,15 +272,41 @@ def create_app(
             except UnicodeDecodeError, ValidationError, ValueError:
                 raise WorkerError from None
             assert oauth_state.installation_id is not None
+            assert oauth_state.target_branch is not None
             assert oauth_state.base_commit_sha is not None
             assert oauth_state.engine_selector is not None
             assert oauth_state.engine_commit_sha is not None
             issued_state = app.state.state_manager.issue_cms_enablement_confirmation(
                 oauth_state.repository_id,
                 oauth_state.installation_id,
+                oauth_state.target_branch,
                 oauth_state.base_commit_sha,
                 oauth_state.engine_selector,
                 oauth_state.engine_commit_sha,
+            )
+            return redirect_to_github(issued_state, oauth_state.repository_id)
+
+        @app.post("/setup/select-branch")
+        async def setup_select_branch(request: Request) -> RedirectResponse:
+            """Require fresh authorization after the creator chooses a verified branch."""
+            try:
+                form_data = parse_qs((await request.body()).decode("utf-8"))
+                selection = CmsSetupBranchSelectionRequest.model_validate(
+                    {name: values[0] for name, values in form_data.items() if values}
+                )
+                oauth_state = app.state.state_manager.consume_from_cookies(
+                    selection.state, request.cookies
+                )
+                if oauth_state.flow is not OAuthFlow.CMS_ENABLEMENT_REPOSITORY:
+                    raise ValueError
+                assert oauth_state.repository_id is not None
+                assert oauth_state.installation_id is not None
+            except UnicodeDecodeError, ValidationError, ValueError:
+                raise WorkerError from None
+            issued_state = app.state.state_manager.issue_cms_enablement_branch(
+                oauth_state.repository_id,
+                oauth_state.installation_id,
+                selection.target_branch,
             )
             return redirect_to_github(issued_state, oauth_state.repository_id)
 
@@ -349,6 +397,8 @@ def create_app(
                     return await cms_enablement_installation_callback(oauth_state, code, state)
                 if oauth_state.flow is OAuthFlow.CMS_ENABLEMENT_REPOSITORY:
                     return await cms_enablement_repository_callback(oauth_state, code)
+                if oauth_state.flow is OAuthFlow.CMS_ENABLEMENT_BRANCH:
+                    return await cms_enablement_branch_callback(oauth_state, code)
                 if oauth_state.flow is OAuthFlow.CMS_ENABLEMENT_CONFIRMATION:
                     return await cms_enablement_confirmation_callback(oauth_state, code)
                 assert oauth_state.origin is not None
@@ -427,11 +477,7 @@ def create_app(
                     status_code=error.status_code,
                     public_message=error.public_message,
                 )
-                if oauth_state.flow in {
-                    OAuthFlow.CMS_ENABLEMENT_INSTALLATION,
-                    OAuthFlow.CMS_ENABLEMENT_REPOSITORY,
-                    OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
-                }:
+                if oauth_state.flow in _CMS_ENABLEMENT_FLOWS:
                     return HTMLResponse(
                         render_management_result_page(
                             error.public_message,
@@ -452,6 +498,37 @@ def create_app(
                 return HTMLResponse(
                     render_error_callback_page(oauth_state.origin, error.public_message),
                     status_code=error.status_code,
+                )
+            except Exception as error:
+                log_event(
+                    logger,
+                    "oauth_callback_unexpected_failure",
+                    severity=logging.ERROR,
+                    flow=oauth_state.flow,
+                    repository_id=oauth_state.repository_id,
+                    error_type=type(error).__name__,
+                )
+                if oauth_state.flow in _CMS_ENABLEMENT_FLOWS:
+                    return HTMLResponse(
+                        render_management_result_page(
+                            WorkerError.public_message,
+                            heading="comic_git CMS setup could not continue",
+                            diagnostic_code="unexpected_callback_failure",
+                        ),
+                        status_code=500,
+                    )
+                if oauth_state.flow is OAuthFlow.ORIGIN_MIGRATION:
+                    return HTMLResponse(
+                        render_management_result_page(
+                            WorkerError.public_message,
+                            heading="CMS origin migration could not continue",
+                            diagnostic_code="unexpected_callback_failure",
+                        ),
+                        status_code=500,
+                    )
+                return HTMLResponse(
+                    render_error_callback_page(oauth_state.origin, WorkerError.public_message),
+                    status_code=500,
                 )
 
         async def enrollment_callback(
@@ -573,6 +650,7 @@ def create_app(
         async def build_logged_cms_migration_preview(
             repository: GitHubRepository,
             user_access_token: SecretStr,
+            target_branch: str,
         ) -> tuple[TargetRepositoryState, CmsMigrationPreview]:
             """Log non-secret setup milestones around the bounded migration-planning boundary."""
             repository_fields = {
@@ -580,10 +658,11 @@ def create_app(
                 "repository_owner": repository.owner.login,
                 "repository_name": repository.name,
                 "default_branch": repository.default_branch,
+                "target_branch": target_branch,
             }
             log_event(logger, "cms_setup_repository_verified", **repository_fields)
             target_state = await read_target_repository_state(
-                app.state.github_client, user_access_token, repository
+                app.state.github_client, user_access_token, repository, target_branch
             )
             log_event(
                 logger,
@@ -643,7 +722,7 @@ def create_app(
                 target_state,
                 selector,
                 engine_commit_sha,
-                _cms_enablement_input(worker_settings, repository),
+                _cms_enablement_input(worker_settings, repository, target_branch),
             )
             log_event(
                 logger,
@@ -661,7 +740,7 @@ def create_app(
             oauth_state: OAuthState,
             code: str,
         ) -> HTMLResponse:
-            """Render a verified engine-produced plan before a direct setup can request a PR."""
+            """Render branches after repository access is proven with a fresh user token."""
             assert oauth_state.repository_id is not None
             assert oauth_state.installation_id is not None
             access_token = await app.state.github_client.exchange_authorization_code(
@@ -679,19 +758,84 @@ def create_app(
             await app.state.github_client.require_repository_administrator(
                 access_token.access_token, repository, github_user.login
             )
+            branches = await app.state.github_client.list_repository_branches(
+                access_token.access_token, repository
+            )
+            if (
+                not branches
+                or repository.default_branch is None
+                or repository.default_branch not in {branch.name for branch in branches}
+            ):
+                raise WorkerError
+            branch_selection = app.state.state_manager.issue_cms_enablement_repository(
+                repository.id, oauth_state.installation_id
+            )
+            log_event(
+                logger,
+                "cms_setup_branch_selection_ready",
+                repository_id=repository.id,
+                repository_owner=repository.owner.login,
+                repository_name=repository.name,
+                default_branch=repository.default_branch,
+                branch_count=len(branches),
+            )
+            response = HTMLResponse(
+                render_cms_branch_selection_page(
+                    branch_selection.token,
+                    repository,
+                    tuple(
+                        sorted(
+                            branches,
+                            key=lambda branch: (
+                                branch.name != repository.default_branch,
+                                branch.name.casefold(),
+                            ),
+                        )
+                    ),
+                )
+            )
+            app.state.state_manager.attach_correlation_cookie(response, branch_selection)
+            return response
+
+        async def cms_enablement_branch_callback(
+            oauth_state: OAuthState,
+            code: str,
+        ) -> HTMLResponse:
+            """Render a verified engine-produced plan for the creator-selected repository branch."""
+            assert oauth_state.repository_id is not None
+            assert oauth_state.installation_id is not None
+            assert oauth_state.target_branch is not None
+            access_token = await app.state.github_client.exchange_authorization_code(
+                code, oauth_state.repository_id
+            )
+            github_user = await app.state.github_client.get_authenticated_user(
+                access_token.access_token
+            )
+            build_access_policy(worker_settings).require_permitted(
+                github_user.login, AccessOperation.ENROLLMENT
+            )
+            repository = await app.state.github_client.verify_bound_repository_access(
+                access_token.access_token, oauth_state.installation_id, oauth_state.repository_id
+            )
+            await app.state.github_client.require_repository_administrator(
+                access_token.access_token, repository, github_user.login
+            )
             _, preview = await build_logged_cms_migration_preview(
-                repository, access_token.access_token
+                repository, access_token.access_token, oauth_state.target_branch
             )
             confirmation = app.state.state_manager.issue_cms_enablement_confirmation(
                 repository.id,
                 oauth_state.installation_id,
+                preview.target_branch,
                 preview.base_commit_sha,
                 preview.engine_selector,
                 preview.engine_commit_sha,
             )
-            return HTMLResponse(
+            response = HTMLResponse(
                 render_cms_migration_summary_page(confirmation.token, repository, preview)
             )
+            app.state.state_manager.attach_correlation_cookie(response, confirmation)
+            return response
 
         async def cms_enablement_confirmation_callback(
             oauth_state: OAuthState,
@@ -700,6 +844,7 @@ def create_app(
             """Revalidate a reviewed plan, then create its one atomic migration pull request."""
             assert oauth_state.repository_id is not None
             assert oauth_state.installation_id is not None
+            assert oauth_state.target_branch is not None
             assert oauth_state.base_commit_sha is not None
             assert oauth_state.engine_selector is not None
             assert oauth_state.engine_commit_sha is not None
@@ -719,18 +864,20 @@ def create_app(
                 access_token.access_token, repository, github_user.login
             )
             target_state, preview = await build_logged_cms_migration_preview(
-                repository, access_token.access_token
+                repository, access_token.access_token, oauth_state.target_branch
             )
             if (
-                preview.base_commit_sha != oauth_state.base_commit_sha
+                preview.target_branch != oauth_state.target_branch
+                or preview.base_commit_sha != oauth_state.base_commit_sha
                 or preview.engine_selector != oauth_state.engine_selector
                 or preview.engine_commit_sha != oauth_state.engine_commit_sha
             ):
                 raise WorkerError
-            branch_name = f"comic-git/cms-enable/{preview.base_commit_sha[:12]}"
+            branch_name = migration_branch_name(preview.target_branch, preview.base_commit_sha)
             operation = await app.state.operation_store.put_planned(
                 EnablementOperation.create(
                     repository_id=repository.id,
+                    target_branch=preview.target_branch,
                     base_commit_sha=preview.base_commit_sha,
                     engine_selector=preview.engine_selector,
                     engine_commit_sha=preview.engine_commit_sha,
@@ -749,7 +896,7 @@ def create_app(
                 )
                 return HTMLResponse(render_cms_migration_result_page(operation.pull_request_url))
             claim = await app.state.operation_store.claim_writing(
-                repository.id, preview.base_commit_sha
+                repository.id, preview.target_branch, preview.base_commit_sha
             )
             if not claim.acquired:
                 existing_pr = await app.state.github_client.find_open_repository_pull_request(
@@ -759,6 +906,7 @@ def create_app(
                     raise WorkerError
                 operation = await app.state.operation_store.complete(
                     repository.id,
+                    preview.target_branch,
                     preview.base_commit_sha,
                     existing_pr.number,
                     existing_pr.html_url,
@@ -783,6 +931,7 @@ def create_app(
                 repository_name=repository.name,
                 base_commit_sha=preview.base_commit_sha,
                 branch_name=branch_name,
+                target_branch=preview.target_branch,
                 planned_file_count=len(preview.files),
             )
             changes = tuple(GitHubTreeChange(file.path, file.content) for file in preview.files)
@@ -818,13 +967,18 @@ def create_app(
                 "Enable comic_git CMS",
                 (
                     f"Engine selector: `{preview.engine_selector}`\n\n"
-                    f"Resolved engine SHA: `{preview.engine_commit_sha}`"
+                    f"Resolved engine SHA: `{preview.engine_commit_sha}`\n\n"
+                    f"Target branch: `{preview.target_branch}`"
                 ),
                 branch_name,
-                repository.default_branch or "",
+                preview.target_branch,
             )
             operation = await app.state.operation_store.complete(
-                repository.id, preview.base_commit_sha, pull_request.number, pull_request.html_url
+                repository.id,
+                preview.target_branch,
+                preview.base_commit_sha,
+                pull_request.number,
+                pull_request.html_url,
             )
             log_event(
                 logger,
@@ -833,6 +987,7 @@ def create_app(
                 repository_owner=repository.owner.login,
                 repository_name=repository.name,
                 base_commit_sha=preview.base_commit_sha,
+                target_branch=preview.target_branch,
                 pull_request_number=pull_request.number,
                 pull_request_url=pull_request.html_url,
             )
@@ -1047,6 +1202,7 @@ def _cors_headers(origin: str) -> dict[str, str]:
 def _cms_enablement_input(
     settings: WorkerSettings,
     repository: object,
+    target_branch: str,
 ) -> dict[str, object]:
     """Provide the fixed worker-owned CMS settings the engine serializer may include in TOML."""
     if settings.public_base_url is None:
@@ -1054,15 +1210,14 @@ def _cms_enablement_input(
     try:
         owner = repository.owner.login
         name = repository.name
-        branch = repository.default_branch
     except AttributeError:
         raise WorkerError from None
-    if branch is None:
+    if not target_branch:
         raise WorkerError
     backend_base_url = str(settings.public_base_url).rstrip("/")
     return {
         "repository": f"{owner}/{name}",
-        "branch": branch,
+        "branch": target_branch,
         "backend_base_url": backend_base_url,
         "backend_auth_endpoint": f"{backend_base_url}/auth",
         "editorial_workflow": False,

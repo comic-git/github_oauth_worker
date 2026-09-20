@@ -77,6 +77,16 @@ def configure_event_logger(
     return logger
 
 
-def log_event(logger: logging.Logger, event: str, **fields: object) -> None:
+def log_event(
+    logger: logging.Logger,
+    event: str,
+    *,
+    severity: int = logging.INFO,
+    **fields: object,
+) -> None:
     """Write a Cloud Logging JSON payload without allowing callers to serialize sensitive values."""
-    logger.info(event, extra={"json_fields": {"event": event, **sanitize_log_fields(fields)}})
+    logger.log(
+        severity,
+        event,
+        extra={"json_fields": {"event": event, **sanitize_log_fields(fields)}},
+    )

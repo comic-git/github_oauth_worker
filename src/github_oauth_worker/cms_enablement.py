@@ -51,8 +51,8 @@ class CmsEnablementError(WorkerError):
             "`your_content/comic_info.toml` file with an engine version."
         ),
         "repository_revision_invalid": (
-            "CMS setup could not read the repository's default branch revision. Try again after "
-            "confirming the repository has an ordinary default branch."
+            "CMS setup could not read the selected repository branch revision. Try again after "
+            "confirming the branch still exists and contains an ordinary commit."
         ),
         "target_content_invalid": (
             "CMS setup could not safely read this repository's `your_content` files. Use ordinary "
@@ -121,6 +121,7 @@ class TargetRepositoryState:
     """Verified target revision data needed to plan a migration without a repository checkout."""
 
     base_commit_sha: str
+    target_branch: str
     tree: GitHubGitTree
     config_path: str
     engine_selector: str
@@ -131,6 +132,7 @@ class CmsMigrationPreview:
     """Non-secret creator-facing migration summary produced by a fixed engine revision."""
 
     base_commit_sha: str
+    target_branch: str
     engine_selector: str
     engine_commit_sha: str
     changed_paths: tuple[str, ...]
@@ -220,6 +222,8 @@ async def materialize_target_snapshot(
     for entry in tree.tree:
         path = validated_content_path(entry.path)
         if path is None:
+            continue
+        if entry.type == "tree":
             continue
         if entry.type != "blob" or entry.mode == "120000":
             raise CmsEnablementError("target_content_invalid")
@@ -348,13 +352,12 @@ async def read_target_repository_state(
     client: GitHubAppClient,
     user_access_token: SecretStr,
     repository: GitHubRepository,
+    target_branch: str,
 ) -> TargetRepositoryState:
-    """Read a target revision and only its main-config engine selector before source resolution."""
-    if repository.default_branch is None:
+    """Read one selected branch revision and its main-config selector before source resolution."""
+    if not target_branch:
         raise CmsEnablementError("repository_revision_invalid")
-    ref = await client.get_repository_ref(
-        user_access_token, repository, f"heads/{repository.default_branch}"
-    )
+    ref = await client.get_repository_ref(user_access_token, repository, f"heads/{target_branch}")
     if ref.object.type != "commit":
         raise CmsEnablementError("repository_revision_invalid")
     commit = await client.get_repository_commit(user_access_token, repository, ref.object.sha)
@@ -365,6 +368,7 @@ async def read_target_repository_state(
     blob = await client.get_repository_blob(user_access_token, repository, config_entry.sha)
     return TargetRepositoryState(
         base_commit_sha=commit.sha,
+        target_branch=target_branch,
         tree=tree,
         config_path=config_entry.path,
         engine_selector=parse_engine_selector(config_entry.path, decode_text_blob(blob)),
@@ -396,6 +400,7 @@ async def build_migration_preview(
         plan = run_engine_migration(engine, snapshot_root, cms_enablement)
     return CmsMigrationPreview(
         base_commit_sha=state.base_commit_sha,
+        target_branch=state.target_branch,
         engine_selector=selector.value,
         engine_commit_sha=engine_commit_sha,
         changed_paths=tuple(file.path for file in plan.files),

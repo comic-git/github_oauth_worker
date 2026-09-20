@@ -10,11 +10,13 @@ from github_oauth_worker.enablement_operations import (
     EnablementOperationStatus,
     FirestoreEnablementOperationStore,
     InMemoryEnablementOperationStore,
+    migration_branch_name,
     operation_document_id,
 )
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+TARGET_BRANCH = "cms"
 
 
 @pytest.mark.parametrize(
@@ -36,9 +38,11 @@ def test_operation_store_claims_one_write_and_retains_completed_pr(
             store = store_type(now=lambda: now)
         planned = await store.put_planned(_operation(now))
 
-        claim = await store.claim_writing(123, SHA_A)
-        repeat_claim = await store.claim_writing(123, SHA_A)
-        completed = await store.complete(123, SHA_A, 4, "https://github.com/owner/comic/pull/4")
+        claim = await store.claim_writing(123, TARGET_BRANCH, SHA_A)
+        repeat_claim = await store.claim_writing(123, TARGET_BRANCH, SHA_A)
+        completed = await store.complete(
+            123, TARGET_BRANCH, SHA_A, 4, "https://github.com/owner/comic/pull/4"
+        )
 
         assert planned.status is EnablementOperationStatus.PLANNED
         assert claim.acquired
@@ -46,7 +50,7 @@ def test_operation_store_claims_one_write_and_retains_completed_pr(
         assert repeat_claim.operation.status is EnablementOperationStatus.WRITING
         assert completed.status is EnablementOperationStatus.COMPLETED
         assert completed.pull_request_number == 4
-        assert (await store.get(123, SHA_A)) == completed
+        assert (await store.get(123, TARGET_BRANCH, SHA_A)) == completed
 
     asyncio.run(scenario())
 
@@ -67,14 +71,39 @@ def test_new_plan_refreshes_only_a_non_writing_operation() -> None:
 
 
 def test_operation_document_key_has_only_immutable_identifiers() -> None:
-    assert operation_document_id(123, SHA_A) == f"123-{SHA_A}"
+    assert operation_document_id(123, TARGET_BRANCH, SHA_A).endswith(f"-{SHA_A}")
+    assert operation_document_id(123, "cms/preview", SHA_A) != operation_document_id(
+        123, TARGET_BRANCH, SHA_A
+    )
+    assert migration_branch_name(TARGET_BRANCH, SHA_A) != migration_branch_name("main", SHA_A)
     with pytest.raises(ValueError):
-        operation_document_id(0, SHA_A)
+        operation_document_id(0, TARGET_BRANCH, SHA_A)
 
 
-def _operation(now: datetime, engine_commit_sha: str = SHA_B) -> EnablementOperation:
+def test_operations_with_the_same_commit_are_isolated_by_target_branch() -> None:
+    async def scenario() -> None:
+        store = InMemoryEnablementOperationStore()
+        cms_operation = await store.put_planned(_operation(datetime.now(UTC), TARGET_BRANCH))
+        main_operation = await store.put_planned(_operation(datetime.now(UTC), "main"))
+
+        claim = await store.claim_writing(123, TARGET_BRANCH, SHA_A)
+
+        assert claim.acquired
+        assert cms_operation.target_branch == TARGET_BRANCH
+        assert main_operation.target_branch == "main"
+        assert (await store.get(123, "main", SHA_A)) == main_operation
+
+    asyncio.run(scenario())
+
+
+def _operation(
+    now: datetime,
+    target_branch: str = TARGET_BRANCH,
+    engine_commit_sha: str = SHA_B,
+) -> EnablementOperation:
     return EnablementOperation.create(
         repository_id=123,
+        target_branch=target_branch,
         base_commit_sha=SHA_A,
         engine_selector="cms",
         engine_commit_sha=engine_commit_sha,

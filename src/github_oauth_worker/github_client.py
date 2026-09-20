@@ -59,6 +59,14 @@ class GitHubRepository(BaseModel):
     default_branch: str | None = Field(default=None, min_length=1)
 
 
+class GitHubRepositoryBranch(BaseModel):
+    """One repository branch that GitHub exposed to the authorized setup user."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    name: str = Field(min_length=1)
+
+
 class GitHubUserAccessToken(BaseModel):
     """Short-lived GitHub App user credentials kept only in the active request flow."""
 
@@ -200,6 +208,7 @@ class GitHubAppClient:
     _API_VERSION = "2026-03-10"
     _REQUEST_TIMEOUT_SECONDS = 10.0
     _MAXIMUM_REPOSITORY_PAGES = 100
+    _MAXIMUM_BRANCH_PAGES = 100
 
     def __init__(
         self,
@@ -309,6 +318,28 @@ class GitHubAppClient:
             user_access_token,
         )
         return self._validate_response(GitHubRepository, response_data)
+
+    async def list_repository_branches(
+        self,
+        user_access_token: SecretStr,
+        repository: GitHubRepository,
+    ) -> tuple[GitHubRepositoryBranch, ...]:
+        """List a bounded set of branches that the authorized user can read in one repository."""
+        branches: list[GitHubRepositoryBranch] = []
+        for page in range(1, self._MAXIMUM_BRANCH_PAGES + 1):
+            response_data = await self._repository_api_json_list(
+                repository,
+                "/branches",
+                user_access_token,
+                params={"page": page, "per_page": 100},
+            )
+            page_branches = tuple(
+                self._validate_response(GitHubRepositoryBranch, branch) for branch in response_data
+            )
+            branches.extend(page_branches)
+            if len(page_branches) < 100:
+                return tuple(branches)
+        raise GitHubClientError
 
     async def verify_bound_repository_access(
         self,

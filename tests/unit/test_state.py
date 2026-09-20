@@ -98,6 +98,20 @@ def test_invalid_state_error_is_a_generic_worker_error(state_manager: OAuthState
     assert error.value.public_message == "The authorization request could not be verified."
 
 
+def test_branch_bound_state_retains_the_selected_branch(state_manager: OAuthStateManager) -> None:
+    issued_state = state_manager.issue_cms_enablement_branch(123, 456, "cms")
+
+    state = state_manager.consume(
+        issued_state.token,
+        issued_state.correlation_nonce,
+        OAuthFlow.CMS_ENABLEMENT_BRANCH,
+    )
+
+    assert state.repository_id == 123
+    assert state.installation_id == 456
+    assert state.target_branch == "cms"
+
+
 def _issue_state(state_manager: OAuthStateManager, flow: OAuthFlow):
     if flow is OAuthFlow.DECAP:
         return state_manager.issue_decap("https://cms.example.com", 123, 456)
@@ -109,8 +123,12 @@ def _issue_state(state_manager: OAuthStateManager, flow: OAuthFlow):
         return state_manager.issue_cms_enablement_installation(456)
     if flow is OAuthFlow.CMS_ENABLEMENT_REPOSITORY:
         return state_manager.issue_cms_enablement_repository(123, 456)
+    if flow is OAuthFlow.CMS_ENABLEMENT_BRANCH:
+        return state_manager.issue_cms_enablement_branch(123, 456, "cms")
     if flow is OAuthFlow.CMS_ENABLEMENT_CONFIRMATION:
-        return state_manager.issue_cms_enablement_confirmation(123, 456, "a" * 40, "cms", "b" * 40)
+        return state_manager.issue_cms_enablement_confirmation(
+            123, 456, "cms", "a" * 40, "cms", "b" * 40
+        )
     return state_manager.issue_origin_migration(
         "https://cms.example.com",
         "https://new-cms.example.com",

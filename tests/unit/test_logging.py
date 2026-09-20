@@ -42,6 +42,18 @@ def test_log_event_emits_json_without_sensitive_values(caplog: pytest.LogCapture
     }
 
 
+def test_log_event_accepts_an_explicit_error_severity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger = logging.getLogger("github_oauth_worker.test")
+
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        log_event(logger, "oauth_callback_unexpected_failure", severity=logging.ERROR)
+
+    assert caplog.records[-1].levelno == logging.ERROR
+    assert caplog.messages[-1] == "oauth_callback_unexpected_failure"
+
+
 def test_event_logger_writes_raw_json_to_its_stream() -> None:
     stream = io.StringIO()
     logger = configure_event_logger(
