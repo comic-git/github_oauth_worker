@@ -1318,6 +1318,91 @@ def test_cms_branch_callback_returns_a_safe_page_for_a_migration_error(monkeypat
     assert "Internal Server Error" not in response.text
 
 
+def test_cms_branch_callback_rejects_an_old_engine_before_loading_source(monkeypatch) -> None:
+    async def read_old_engine(*_args: object) -> TargetRepositoryState:
+        return TargetRepositoryState(
+            base_commit_sha="a" * 40,
+            target_branch="cms",
+            tree=GitHubGitTree(sha="b" * 40, tree=()),
+            config_path="your_content/comic_info.ini",
+            engine_selector="1.1",
+        )
+
+    async def unexpected_source_resolution(*_args: object) -> str:
+        pytest.fail("Unsupported engine source must not be loaded")
+
+    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_old_engine)
+    monkeypatch.setattr(
+        "github_oauth_worker.app.resolve_official_engine_commit", unexpected_source_resolution
+    )
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=_FakeGitHubClient(),
+    )
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+
+    response = TestClient(app).get(
+        f"/callback?code=one-time-code&state={issued_state.token}",
+        headers={"Cookie": f"{issued_state.cookie_name}={issued_state.correlation_nonce}"},
+    )
+
+    assert response.status_code == 400
+    assert "engine_version_too_old" in response.text
+    assert "1.2 or newer" in response.text
+    assert "1.1" in response.text
+
+
+def test_cms_branch_callback_reports_an_already_enabled_site_without_a_pr(monkeypatch) -> None:
+    async def read_target(*_args: object) -> TargetRepositoryState:
+        return TargetRepositoryState(
+            base_commit_sha="a" * 40,
+            target_branch="cms",
+            tree=GitHubGitTree(sha="b" * 40, tree=()),
+            config_path="your_content/comic_info.toml",
+            engine_selector="cms",
+        )
+
+    async def resolve_engine(*_args: object) -> str:
+        return "c" * 40
+
+    async def build_preview(*_args: object) -> CmsMigrationPreview:
+        return CmsMigrationPreview(
+            base_commit_sha="a" * 40,
+            target_branch="cms",
+            engine_selector="cms",
+            engine_commit_sha="c" * 40,
+            changed_paths=(),
+            files=(),
+            already_enabled=True,
+        )
+
+    class NoPullRequestClient(_FakeGitHubClient):
+        async def list_open_repository_pull_requests(self, *_args):
+            pytest.fail("Already-enabled setup must not inspect or create migration PRs")
+
+    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_target)
+    monkeypatch.setattr("github_oauth_worker.app.resolve_official_engine_commit", resolve_engine)
+    monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=NoPullRequestClient(),
+    )
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+
+    response = TestClient(app).get(
+        f"/callback?code=one-time-code&state={issued_state.token}",
+        headers={"Cookie": f"{issued_state.cookie_name}={issued_state.correlation_nonce}"},
+    )
+
+    assert response.status_code == 200
+    assert "comic_git CMS is already enabled" in response.text
+    assert "owner/comic" in response.text
+    assert "No migration pull request is needed" in response.text
+    assert "Create migration pull request" not in response.text
+
+
 def test_cms_branch_callback_logs_safe_migration_diagnostics(monkeypatch) -> None:
     async def fail_target_state(*_args: object) -> TargetRepositoryState:
         raise CmsEnablementError(

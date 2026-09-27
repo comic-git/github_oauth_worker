@@ -44,7 +44,10 @@ IMAGE_SUFFIXES = frozenset(
     {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".gif", ".bmp", ".webp", ".webv", ".svg", ".eps"}
 )
 SUPPORTED_RUNNER_RUNTIME_PACKAGES = frozenset({"tomli-w"})
-RUNNER_FAILURE_CODES = frozenset({"request_invalid", "internal_error"})
+RUNNER_FAILURE_CODES = frozenset({
+    "request_invalid", "internal_error", "cms_toml_not_enabled", "cms_settings_mismatch",
+    "cms_not_ready",
+})
 
 
 def migration_branch_name(target_branch: str, base_commit_sha: str) -> str:
@@ -80,6 +83,18 @@ class CmsEnablementError(WorkerError):
         "migration_runner_failed": (
             "The configured comic_git engine could not prepare a CMS migration. Update to a "
             "compatible engine version and try again."
+        ),
+        "cms_toml_not_enabled": (
+            "This repository already uses TOML, but CMS is not enabled. Enabling CMS for an "
+            "existing TOML site is not supported by this setup flow yet."
+        ),
+        "cms_settings_mismatch": (
+            "CMS is enabled on this branch, but its repository, branch, or OAuth settings differ "
+            "from this worker. Review the existing comic_info.toml settings before retrying."
+        ),
+        "cms_not_ready": (
+            "This TOML-backed branch does not pass the engine's CMS editing checks. "
+            "Run the engine's CMS build to see the files that need attention."
         ),
         "migration_plan_invalid": (
             "The configured comic_git engine returned an invalid CMS migration plan. Update to a "
@@ -134,6 +149,7 @@ class RunnerMigrationPlan:
     """A validated migration-runner response that contains no executable target content."""
 
     files: tuple[MigrationPlanFile, ...]
+    already_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -157,6 +173,7 @@ class CmsMigrationPreview:
     engine_commit_sha: str
     changed_paths: tuple[str, ...]
     files: tuple[MigrationPlanFile, ...]
+    already_enabled: bool = False
 
 
 class MigrationFileChangeKind(StrEnum):
@@ -417,8 +434,14 @@ def run_engine_migration(
         ) from None
     stdout_bytes = len(result.stdout.encode("utf-8"))
     if result.returncode != 0:
+        failure_code = parse_runner_failure_code(result.stderr)
+        diagnostic_code = (
+            failure_code
+            if failure_code in {"cms_toml_not_enabled", "cms_settings_mismatch", "cms_not_ready"}
+            else "migration_runner_failed"
+        )
         raise CmsEnablementError(
-            "migration_runner_failed",
+            diagnostic_code,
             safe_log_fields=runner_failure_log_fields(result, "nonzero_exit", stdout_bytes),
         )
     if stdout_bytes > MAXIMUM_RUNNER_OUTPUT_BYTES:
@@ -462,15 +485,20 @@ def parse_runner_failure_code(stderr: str) -> str:
 
 
 def parse_runner_plan(output: str) -> RunnerMigrationPlan:
-    """Validate that a runner response can alter only normalized TOML paths under your_content."""
+    """Validate a migration or explicit no-op result from the trusted engine runner."""
     try:
         data = json.loads(output)
     except ValueError:
         raise CmsEnablementError("migration_plan_invalid") from None
     if not isinstance(data, dict) or data.get("protocol_version") != RUNNER_PROTOCOL_VERSION:
         raise CmsEnablementError("migration_plan_invalid")
+    outcome = data.get("outcome", "migration_required")
+    if not isinstance(outcome, str) or outcome not in {"migration_required", "already_enabled"}:
+        raise CmsEnablementError("migration_plan_invalid")
     files = data.get("files")
-    if not isinstance(files, list) or not files:
+    if not isinstance(files, list) or (not files and outcome != "already_enabled"):
+        raise CmsEnablementError("migration_plan_invalid")
+    if outcome == "already_enabled" and files:
         raise CmsEnablementError("migration_plan_invalid")
     planned_files = []
     paths = set()
@@ -485,7 +513,7 @@ def parse_runner_plan(output: str) -> RunnerMigrationPlan:
             raise CmsEnablementError("migration_plan_invalid")
         paths.add(path)
         planned_files.append(MigrationPlanFile(path, content))
-    return RunnerMigrationPlan(tuple(planned_files))
+    return RunnerMigrationPlan(tuple(planned_files), already_enabled=outcome == "already_enabled")
 
 
 async def read_target_repository_state(
@@ -545,6 +573,7 @@ async def build_migration_preview(
         engine_commit_sha=engine_commit_sha,
         changed_paths=tuple(file.path for file in plan.files),
         files=plan.files,
+        already_enabled=plan.already_enabled,
     )
 
 
@@ -579,12 +608,11 @@ def parse_engine_selector(config_path: str, contents: str) -> str:
 
 
 def _main_config_entry(tree: GitHubGitTree):
-    """Select exactly one supported main config and reject ambiguous CMS migration input."""
-    entries = [
-        entry
-        for entry in tree.tree
-        if entry.path in {"your_content/comic_info.toml", "your_content/comic_info.ini"}
-    ]
-    if len(entries) != 1 or entries[0].type != "blob" or entries[0].mode == "120000":
+    """Use TOML when present, matching the engine's main-config precedence."""
+    entries = {entry.path: entry for entry in tree.tree}
+    entry = entries.get("your_content/comic_info.toml") or entries.get(
+        "your_content/comic_info.ini"
+    )
+    if entry is None or entry.type != "blob" or entry.mode == "120000":
         raise CmsEnablementError("repository_config_invalid")
-    return entries[0]
+    return entry

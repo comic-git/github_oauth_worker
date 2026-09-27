@@ -30,7 +30,7 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 
 ## Deferred Work
 
-- Make `/setup` classify the selected branch before planning a migration: legacy INI, migrated TOML with retained INI, TOML without INI, already CMS-enabled, and invalid or partial configurations. Treat a valid already-enabled branch as a successful no-op and allow a TOML-ready branch to enable CMS without rerunning TOML migration. Do not classify every repository containing TOML as successfully enabled.
+- Let `/setup` enable CMS on an existing TOML-backed branch where CMS is still disabled, without rerunning legacy migration or silently discarding TOML comments. Classify mixed or partial configurations more precisely and offer actionable remediation. A matching, CMS-ready TOML branch already returns a successful no-op; merely containing TOML does not.
 - Provision a global external Application Load Balancer for the production worker before assigning its custom domain.
 - Map the production worker to a stable custom domain such as `oauth.comic-git.com`. Manage the domain, TLS, DNS records, load-balancer routing, and worker public URL through the production infrastructure configuration before publishing that URL to users.
 - On App installation or update, validate and reconcile worker-owned CMS configuration so reinstalling the App repairs incorrect repository, branch, or worker endpoint settings. Evaluate other narrowly scoped, safe automatic repairs separately.

@@ -396,6 +396,59 @@ def test_target_state_reads_the_creator_selected_branch() -> None:
     asyncio.run(scenario())
 
 
+def test_target_state_prefers_toml_when_legacy_config_is_retained() -> None:
+    class TargetStateClient:
+        async def get_repository_ref(self, _token, _repository, _ref):
+            return GitHubGitReference(
+                ref="refs/heads/cms", object=GitHubGitObject(type="commit", sha=SHA_A)
+            )
+
+        async def get_repository_commit(self, _token, _repository, _sha):
+            return GitHubGitCommit(sha=SHA_A, tree=GitHubGitSha(sha=SHA_B))
+
+        async def get_repository_tree(self, _token, _repository, _sha):
+            return GitHubGitTree(
+                sha=SHA_B,
+                tree=(
+                    _entry("your_content/comic_info.ini", SHA_A, 38),
+                    _entry("your_content/comic_info.toml", SHA_C, 25),
+                ),
+            )
+
+        async def get_repository_blob(self, _token, _repository, sha):
+            assert sha == SHA_C
+            source = '[engine]\nversion = "cms"\n'
+            return GitHubGitBlob(
+                sha=sha, encoding="base64", content=base64.b64encode(source.encode()).decode()
+            )
+
+    state = asyncio.run(
+        read_target_repository_state(
+            TargetStateClient(), SecretStr("token"), _repository(), "cms"
+        )
+    )
+
+    assert state.config_path == "your_content/comic_info.toml"
+    assert state.engine_selector == "cms"
+
+
+def test_runner_accepts_only_an_explicit_empty_already_enabled_result() -> None:
+    result = parse_runner_plan(
+        json.dumps({"protocol_version": 1, "outcome": "already_enabled", "files": []})
+    )
+
+    assert result.already_enabled
+    assert result.files == ()
+    for invalid in (
+        {"protocol_version": 1, "files": []},
+        {"protocol_version": 1, "outcome": "unknown", "files": []},
+        {"protocol_version": 1, "outcome": [], "files": []},
+        {"protocol_version": 1, "outcome": "already_enabled", "files": [{}]},
+    ):
+        with pytest.raises(CmsEnablementError):
+            parse_runner_plan(json.dumps(invalid))
+
+
 def test_runner_uses_a_scrubbed_environment_and_fixed_module(tmp_path: Path) -> None:
     engine = MaterializedEngine(
         root=tmp_path / "engine",
@@ -445,6 +498,24 @@ def test_runner_failure_keeps_only_structured_safe_diagnostics(tmp_path: Path) -
         "runner_stderr_bytes": len(runner_failure.encode("utf-8")),
         "runner_failure_code": "internal_error",
     }
+
+
+def test_runner_surfaces_fixed_toml_setup_failure_without_stderr_text(tmp_path: Path) -> None:
+    engine = MaterializedEngine(
+        root=tmp_path / "engine",
+        contract=EngineMigrationContract(1, "build.migration.runner", ("tomli-w",)),
+    )
+    runner_failure = json.dumps({"protocol_version": 1, "failure_code": "cms_not_ready"})
+
+    with patch(
+        "github_oauth_worker.cms_enablement.subprocess.run",
+        return_value=subprocess.CompletedProcess([], 2, stdout="", stderr=runner_failure),
+    ):
+        with pytest.raises(CmsEnablementError) as raised:
+            run_engine_migration(engine, tmp_path / "snapshot", {"repository": "owner/comic"})
+
+    assert raised.value.diagnostic_code == "cms_not_ready"
+    assert "secret" not in str(raised.value.safe_log_fields())
 
 
 def test_runner_failure_does_not_expose_unstructured_stderr(tmp_path: Path) -> None:

@@ -1269,6 +1269,23 @@ def create_app(
             target_state, preview = await build_logged_cms_migration_preview(
                 repository, access_token.access_token, oauth_state.target_branch
             )
+            if preview.already_enabled:
+                log_event(
+                    logger,
+                    "cms_setup_already_enabled",
+                    repository_id=repository.id,
+                    target_branch=preview.target_branch,
+                    engine_commit_sha=preview.engine_commit_sha,
+                )
+                response = HTMLResponse(
+                    render_management_result_page(
+                        f"CMS is already enabled for {repository.owner.login}/{repository.name} "
+                        f"on branch {preview.target_branch}. No migration pull request is needed.",
+                        heading="comic_git CMS is already enabled",
+                    )
+                )
+                app.state.setup_sessions.clear(response)
+                return response
             branch_name = migration_branch_name(preview.target_branch, preview.base_commit_sha)
             pull_requests = await open_migration_pull_requests(
                 repository, access_token.access_token, preview.target_branch
@@ -1357,6 +1374,8 @@ def create_app(
             target_state, preview = await build_logged_cms_migration_preview(
                 repository, access_token.access_token, oauth_state.target_branch
             )
+            if preview.already_enabled:
+                raise CmsMigrationReviewChangedError
             if (
                 preview.target_branch != oauth_state.target_branch
                 or preview.base_commit_sha != oauth_state.base_commit_sha
