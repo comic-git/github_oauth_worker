@@ -368,9 +368,14 @@ class GitHubAppClient:
         installation_id: int,
         repository_id: int,
     ) -> GitHubRepository:
-        """Prove the binding's installation and repository remain visible to this user token."""
+        """Prove the repository belongs to this user's selected App installation."""
         installations = await self.list_accessible_installations(user_access_token)
         if installation_id not in {installation.id for installation in installations}:
+            raise GitHubAccessVerificationError
+        repositories = await self.list_repositories_for_installation(
+            user_access_token, installation_id
+        )
+        if repository_id not in {repository.id for repository in repositories}:
             raise GitHubAccessVerificationError
         repository = await self.get_repository(user_access_token, repository_id)
         if repository.id != repository_id:

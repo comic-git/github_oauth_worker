@@ -4,12 +4,13 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlencode
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from github_oauth_worker.bindings import (
     BindingStatus,
@@ -29,9 +30,11 @@ from github_oauth_worker.cms_enablement import (
 )
 from github_oauth_worker.cms_setup import (
     render_cms_branch_selection_page,
+    render_cms_discovery_page,
     render_cms_migration_result_page,
     render_cms_migration_summary_page,
     render_cms_repository_selection_page,
+    render_cms_setup_landing_page,
     render_cms_setup_start_page,
 )
 from github_oauth_worker.config import WorkerSettings, load_settings
@@ -59,6 +62,11 @@ from github_oauth_worker.github_client import (
 )
 from github_oauth_worker.logging import configure_event_logger, log_event
 from github_oauth_worker.policy import AccessOperation, build_access_policy
+from github_oauth_worker.setup_session import (
+    InvalidSetupSessionError,
+    SetupSession,
+    SetupSessionManager,
+)
 from github_oauth_worker.state import IssuedOAuthState, OAuthFlow, OAuthState, OAuthStateManager
 
 
@@ -98,6 +106,13 @@ class CmsMigrationRetryError(WorkerError):
     )
 
 
+class CmsSetupCancelledError(WorkerError):
+    """A creator may restart setup after leaving GitHub's authorization screen."""
+
+    diagnostic_code = "cms_setup_authorization_cancelled"
+    public_message = "GitHub authorization was not completed. Start CMS setup again when ready."
+
+
 class EnrollmentSelectionRequest(BaseModel):
     """The signed enrollment state and selected verified repository from the confirmation form."""
 
@@ -125,8 +140,17 @@ class CmsSetupSelectionRequest(BaseModel):
     repository_id: int
 
 
+class CmsSetupDiscoverySelectionRequest(BaseModel):
+    """A signed discovery state and an installation/repository pair shown by GitHub."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: str
+    selection: str = Field(pattern=r"^[1-9][0-9]*:[1-9][0-9]*$")
+
+
 class CmsSetupConfirmationRequest(BaseModel):
-    """A signed reviewed migration summary whose final authorization must be refreshed."""
+    """A signed reviewed migration summary requiring final GitHub access checks."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -164,6 +188,7 @@ async def _validated_form[FormModel: BaseModel](
 
 _CMS_ENABLEMENT_FLOWS = frozenset(
     {
+        OAuthFlow.CMS_ENABLEMENT_DISCOVERY,
         OAuthFlow.CMS_ENABLEMENT_INSTALLATION,
         OAuthFlow.CMS_ENABLEMENT_REPOSITORY,
         OAuthFlow.CMS_ENABLEMENT_BRANCH,
@@ -197,9 +222,72 @@ def create_app(
 
     if worker_settings.service_mode.value == "ready":
 
+        async def run_setup_session_step(
+            request: Request,
+            form_state: OAuthState,
+            next_state: OAuthState,
+            handler: Callable[[OAuthState, SetupSession], Awaitable[HTMLResponse]],
+            *,
+            clear_on_success: bool = False,
+        ) -> HTMLResponse | None:
+            """Use one bounded setup credential across forms and keep errors browser-readable."""
+            try:
+                session = app.state.setup_sessions.read(
+                    request.cookies.get(SetupSessionManager.COOKIE_NAME),
+                    form_state.nonce,
+                    expected_installation_id=form_state.installation_id,
+                    expected_repository_id=form_state.repository_id,
+                )
+                if session is None:
+                    return None
+                response = await handler(next_state, session)
+                if clear_on_success:
+                    app.state.setup_sessions.clear(response)
+                return response
+            except WorkerError as error:
+                log_event(
+                    logger,
+                    "cms_setup_session_step_failed",
+                    repository_id=next_state.repository_id,
+                    error_type=type(error).__name__,
+                    diagnostic_code=error.diagnostic_code,
+                    status_code=error.status_code,
+                    **error.safe_log_fields(),
+                )
+                return HTMLResponse(
+                    render_management_result_page(
+                        error.public_message,
+                        heading="comic_git CMS setup could not continue",
+                        diagnostic_code=error.diagnostic_code,
+                        retry_url="/setup",
+                        retry_label="Start CMS setup again",
+                    ),
+                    status_code=error.status_code,
+                )
+            except Exception as error:
+                log_event(
+                    logger,
+                    "cms_setup_session_step_unexpected_failure",
+                    severity=logging.ERROR,
+                    repository_id=next_state.repository_id,
+                    error_type=type(error).__name__,
+                )
+                return HTMLResponse(
+                    render_management_result_page(
+                        WorkerError.public_message,
+                        heading="comic_git CMS setup could not continue",
+                        diagnostic_code="unexpected_setup_failure",
+                        retry_url="/setup",
+                        retry_label="Start CMS setup again",
+                    ),
+                    status_code=500,
+                )
+
         def redirect_to_github(
             issued_state: IssuedOAuthState,
             repository_id: int | None = None,
+            *,
+            select_account: bool = False,
         ) -> RedirectResponse:
             """Redirect a cookie-bound flow to GitHub without query origin identity."""
             callback_url = f"{str(worker_settings.public_base_url).rstrip('/')}/callback"
@@ -210,6 +298,8 @@ def create_app(
             }
             if repository_id is not None:
                 parameters["repository_id"] = str(repository_id)
+            if select_account:
+                parameters["prompt"] = "select_account"
             response = RedirectResponse(
                 "https://github.com/login/oauth/authorize?" + urlencode(parameters),
                 status_code=302,
@@ -222,6 +312,7 @@ def create_app(
         )
         app.state.github_client = github_client or GitHubAppClient.from_settings(worker_settings)
         app.state.state_manager = OAuthStateManager.from_settings(worker_settings)
+        app.state.setup_sessions = SetupSessionManager.from_settings(worker_settings)
 
     @app.exception_handler(WorkerError)
     async def handle_worker_error(_: Request, error: WorkerError) -> JSONResponse:
@@ -244,15 +335,24 @@ def create_app(
             return HTMLResponse(render_handshake_page())
 
         @app.get("/setup")
-        def setup(installation_id: int) -> HTMLResponse:
-            """Receive GitHub's direct App setup redirect without trusting its installation ID."""
+        def setup(installation_id: int | None = None) -> HTMLResponse:
+            """Start guided setup or receive an untrusted GitHub App installation redirect."""
+            if installation_id is None:
+                return HTMLResponse(render_cms_setup_landing_page())
             if installation_id <= 0:
                 raise WorkerError
             return HTMLResponse(render_cms_setup_start_page(installation_id))
 
+        @app.post("/setup/start")
+        def setup_start() -> RedirectResponse:
+            """Authorize the creator before discovering their App-visible repositories."""
+            return redirect_to_github(
+                app.state.state_manager.issue(OAuthFlow.CMS_ENABLEMENT_DISCOVERY)
+            )
+
         @app.post("/setup/continue")
-        async def setup_continue(request: Request) -> RedirectResponse:
-            """Start fresh authorization before acting on GitHub's untrusted installation query."""
+        async def setup_continue(request: Request) -> Response:
+            """Verify GitHub's installation redirect with the discovery token when possible."""
             try:
                 form_data = parse_qs((await request.body()).decode("utf-8"))
                 installation_id = int(form_data["installation_id"][0])
@@ -260,13 +360,138 @@ def create_app(
                     raise ValueError
             except KeyError, UnicodeDecodeError, ValueError:
                 raise WorkerError from None
+
+            discovery_nonce = request.cookies.get(
+                app.state.state_manager.correlation_cookie_name(OAuthFlow.CMS_ENABLEMENT_DISCOVERY)
+            )
+            if discovery_nonce is not None:
+                try:
+                    session = app.state.setup_sessions.read(
+                        request.cookies.get(SetupSessionManager.COOKIE_NAME),
+                        discovery_nonce,
+                        expected_scope="discovery",
+                    )
+                    if session is not None:
+                        issued_state = app.state.state_manager.issue_cms_enablement_installation(
+                            installation_id
+                        )
+                        oauth_state = app.state.state_manager.consume(
+                            issued_state.token,
+                            issued_state.correlation_nonce,
+                            OAuthFlow.CMS_ENABLEMENT_INSTALLATION,
+                        )
+                        response = await cms_enablement_installation_callback(
+                            oauth_state, session.access_token, issued_state.token
+                        )
+                        app.state.state_manager.attach_correlation_cookie(response, issued_state)
+                        log_event(
+                            logger,
+                            "cms_setup_discovery_authorization_reused",
+                            installation_id=installation_id,
+                        )
+                        return response
+                except WorkerError as error:
+                    log_event(
+                        logger,
+                        "cms_setup_installation_reauthorization_required",
+                        installation_id=installation_id,
+                        error_type=type(error).__name__,
+                    )
             return redirect_to_github(
                 app.state.state_manager.issue_cms_enablement_installation(installation_id)
             )
 
+        @app.post("/setup/switch-account")
+        def setup_switch_account() -> RedirectResponse:
+            """Let the creator choose another GitHub identity and restart discovery."""
+            response = redirect_to_github(
+                app.state.state_manager.issue(OAuthFlow.CMS_ENABLEMENT_DISCOVERY),
+                select_account=True,
+            )
+            app.state.setup_sessions.clear(response)
+            return response
+
+        async def continue_selected_repository(
+            request: Request,
+            form_state: OAuthState,
+            installation_id: int,
+            repository_id: int,
+        ) -> Response:
+            """Verify a selected repo with the brief discovery token, or reauthorize."""
+            issued_state = app.state.state_manager.issue_cms_enablement_repository(
+                repository_id, installation_id
+            )
+            try:
+                session = app.state.setup_sessions.read(
+                    request.cookies.get(SetupSessionManager.COOKIE_NAME),
+                    form_state.nonce,
+                    expected_scope="discovery",
+                )
+            except InvalidSetupSessionError:
+                session = None
+                log_event(
+                    logger,
+                    "cms_setup_repository_reauthorization_required",
+                    repository_id=repository_id,
+                    installation_id=installation_id,
+                    reason="invalid_discovery_session",
+                )
+            if session is not None:
+                repository_state = app.state.state_manager.consume(
+                    issued_state.token,
+                    issued_state.correlation_nonce,
+                    OAuthFlow.CMS_ENABLEMENT_REPOSITORY,
+                )
+                try:
+                    response = await cms_enablement_repository_callback(repository_state, session)
+                except (GitHubClientError, GitHubAccessVerificationError) as error:
+                    log_event(
+                        logger,
+                        "cms_setup_repository_reauthorization_required",
+                        repository_id=repository_id,
+                        installation_id=installation_id,
+                        error_type=type(error).__name__,
+                    )
+                except WorkerError as error:
+                    log_event(
+                        logger,
+                        "cms_setup_repository_selection_failed",
+                        repository_id=repository_id,
+                        installation_id=installation_id,
+                        error_type=type(error).__name__,
+                        diagnostic_code=error.diagnostic_code,
+                    )
+                    return HTMLResponse(
+                        render_management_result_page(
+                            error.public_message,
+                            heading="comic_git CMS setup could not continue",
+                            diagnostic_code=error.diagnostic_code,
+                            retry_url="/setup",
+                            retry_label="Start CMS setup again",
+                        ),
+                        status_code=error.status_code,
+                    )
+                else:
+                    log_event(
+                        logger,
+                        "cms_setup_discovery_authorization_reused_for_repository",
+                        repository_id=repository_id,
+                        installation_id=installation_id,
+                    )
+                    return response
+            elif request.cookies.get(SetupSessionManager.COOKIE_NAME) is None:
+                log_event(
+                    logger,
+                    "cms_setup_repository_reauthorization_required",
+                    repository_id=repository_id,
+                    installation_id=installation_id,
+                    reason="missing_discovery_session",
+                )
+            return redirect_to_github(issued_state, repository_id)
+
         @app.post("/setup/select")
-        async def setup_select(request: Request) -> RedirectResponse:
-            """Request fresh repository-restricted authorization after creator selection."""
+        async def setup_select(request: Request) -> Response:
+            """Verify the selected repository after GitHub's installation redirect."""
             try:
                 form_data = parse_qs((await request.body()).decode("utf-8"))
                 selection = CmsSetupSelectionRequest.model_validate(
@@ -280,14 +505,29 @@ def create_app(
                 assert oauth_state.installation_id is not None
             except UnicodeDecodeError, ValidationError, ValueError:
                 raise WorkerError from None
-            issued_state = app.state.state_manager.issue_cms_enablement_repository(
-                selection.repository_id, oauth_state.installation_id
+            return await continue_selected_repository(
+                request, oauth_state, oauth_state.installation_id, selection.repository_id
             )
-            return redirect_to_github(issued_state, selection.repository_id)
+
+        @app.post("/setup/select-discovered")
+        async def setup_select_discovered(request: Request) -> Response:
+            """Verify the chosen App repository using the discovery session when possible."""
+            selection = await _validated_form(request, CmsSetupDiscoverySelectionRequest)
+            oauth_state = app.state.state_manager.consume_from_cookies(
+                selection.state, request.cookies
+            )
+            if oauth_state.flow is not OAuthFlow.CMS_ENABLEMENT_DISCOVERY:
+                raise WorkerError
+            installation_text, repository_text = selection.selection.split(":")
+            installation_id = int(installation_text)
+            repository_id = int(repository_text)
+            return await continue_selected_repository(
+                request, oauth_state, installation_id, repository_id
+            )
 
         @app.post("/setup/confirm")
-        async def setup_confirm(request: Request) -> RedirectResponse:
-            """Require fresh repository-scoped authorization for the exact reviewed plan."""
+        async def setup_confirm(request: Request) -> Response:
+            """Recheck the exact reviewed plan with its repository-bound setup session."""
             try:
                 form_data = parse_qs((await request.body()).decode("utf-8"))
                 confirmation = CmsSetupConfirmationRequest.model_validate(
@@ -316,11 +556,25 @@ def create_app(
                 oauth_state.engine_commit_sha,
                 oauth_state.reviewed_plan_digest,
             )
+            confirmed_state = app.state.state_manager.consume(
+                issued_state.token,
+                issued_state.correlation_nonce,
+                OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+            )
+            response = await run_setup_session_step(
+                request,
+                oauth_state,
+                confirmed_state,
+                cms_enablement_confirmation_callback,
+                clear_on_success=True,
+            )
+            if response is not None:
+                return response
             return redirect_to_github(issued_state, oauth_state.repository_id)
 
         @app.post("/setup/select-branch")
-        async def setup_select_branch(request: Request) -> RedirectResponse:
-            """Require fresh authorization after the creator chooses a verified branch."""
+        async def setup_select_branch(request: Request) -> Response:
+            """Plan the selected branch using a verified setup session or fresh authorization."""
             try:
                 form_data = parse_qs((await request.body()).decode("utf-8"))
                 selection = CmsSetupBranchSelectionRequest.model_validate(
@@ -340,6 +594,16 @@ def create_app(
                 oauth_state.installation_id,
                 selection.target_branch,
             )
+            branch_state = app.state.state_manager.consume(
+                issued_state.token,
+                issued_state.correlation_nonce,
+                OAuthFlow.CMS_ENABLEMENT_BRANCH,
+            )
+            response = await run_setup_session_step(
+                request, oauth_state, branch_state, cms_enablement_branch_callback
+            )
+            if response is not None:
+                return response
             return redirect_to_github(issued_state, oauth_state.repository_id)
 
         @app.post("/setup/handshake")
@@ -428,7 +692,11 @@ def create_app(
             oauth_state = state_manager.consume_from_cookies(state, request.cookies)
             try:
                 if not code:
+                    if oauth_state.flow is OAuthFlow.CMS_ENABLEMENT_DISCOVERY:
+                        raise CmsSetupCancelledError
                     raise WorkerError
+                if oauth_state.flow is OAuthFlow.CMS_ENABLEMENT_DISCOVERY:
+                    return await cms_enablement_discovery_callback(oauth_state, code, state)
                 if oauth_state.flow is OAuthFlow.CMS_ENABLEMENT_INSTALLATION:
                     return await cms_enablement_installation_callback(oauth_state, code, state)
                 if oauth_state.flow is OAuthFlow.CMS_ENABLEMENT_REPOSITORY:
@@ -515,18 +783,24 @@ def create_app(
                     **error.safe_log_fields(),
                 )
                 if oauth_state.flow in _CMS_ENABLEMENT_FLOWS:
+                    retry_url = None
+                    if isinstance(error, CmsSetupCancelledError):
+                        retry_url = "/setup"
+                    elif (
+                        isinstance(error, (CmsMigrationRetryError, CmsMigrationReviewChangedError))
+                        and oauth_state.installation_id is not None
+                    ):
+                        retry_url = f"/setup?installation_id={oauth_state.installation_id}"
                     return HTMLResponse(
                         render_management_result_page(
                             error.public_message,
                             heading="comic_git CMS setup could not continue",
                             diagnostic_code=error.diagnostic_code,
-                            retry_url=(
-                                f"/setup?installation_id={oauth_state.installation_id}"
-                                if isinstance(
-                                    error, (CmsMigrationRetryError, CmsMigrationReviewChangedError)
-                                )
-                                and oauth_state.installation_id is not None
-                                else None
+                            retry_url=retry_url,
+                            retry_label=(
+                                "Start CMS setup again"
+                                if isinstance(error, CmsSetupCancelledError)
+                                else "Review latest result"
                             ),
                         ),
                         status_code=error.status_code,
@@ -656,26 +930,30 @@ def create_app(
 
         async def cms_enablement_installation_callback(
             oauth_state: OAuthState,
-            code: str,
+            authorization: str | SecretStr,
             state_token: str | None,
         ) -> HTMLResponse:
-            """List only repositories proven visible to the freshly authorized App installation."""
+            """List only repositories proven visible to this authorized GitHub user."""
             assert oauth_state.installation_id is not None
-            access_token = await app.state.github_client.exchange_authorization_code(code)
-            github_user = await app.state.github_client.get_authenticated_user(
-                access_token.access_token
-            )
+            if isinstance(authorization, SecretStr):
+                user_access_token = authorization
+            else:
+                exchanged_token = await app.state.github_client.exchange_authorization_code(
+                    authorization
+                )
+                user_access_token = exchanged_token.access_token
+            github_user = await app.state.github_client.get_authenticated_user(user_access_token)
             build_access_policy(worker_settings).require_permitted(
                 github_user.login, AccessOperation.ENROLLMENT
             )
             installations = await app.state.github_client.list_accessible_installations(
-                access_token.access_token
+                user_access_token
             )
             installation_ids = {installation.id for installation in installations}
             if oauth_state.installation_id not in installation_ids:
                 raise WorkerError
             repositories = await app.state.github_client.list_repositories_for_installation(
-                access_token.access_token, oauth_state.installation_id
+                user_access_token, oauth_state.installation_id
             )
             if not repositories or state_token is None:
                 raise WorkerError
@@ -686,11 +964,62 @@ def create_app(
                 github_login=github_user.login,
                 repository_count=len(repositories),
             )
-            return HTMLResponse(
+            response = HTMLResponse(
                 render_cms_repository_selection_page(
                     state_token, oauth_state.installation_id, repositories
                 )
             )
+            app.state.setup_sessions.attach(
+                response,
+                user_access_token,
+                oauth_state.nonce,
+                scope="discovery",
+            )
+            return response
+
+        async def cms_enablement_discovery_callback(
+            oauth_state: OAuthState,
+            code: str,
+            state_token: str | None,
+        ) -> HTMLResponse:
+            """Show repositories the creator can access through existing App installations."""
+            if state_token is None:
+                raise WorkerError
+            access_token = await app.state.github_client.exchange_authorization_code(code)
+            github_user = await app.state.github_client.get_authenticated_user(
+                access_token.access_token
+            )
+            build_access_policy(worker_settings).require_permitted(
+                github_user.login, AccessOperation.ENROLLMENT
+            )
+            installations = await app.state.github_client.list_accessible_installations(
+                access_token.access_token
+            )
+            choices = []
+            for installation in installations:
+                repositories = await app.state.github_client.list_repositories_for_installation(
+                    access_token.access_token, installation.id
+                )
+                choices.extend((installation.id, repository) for repository in repositories)
+            log_event(
+                logger,
+                "cms_setup_discovery_ready",
+                github_login=github_user.login,
+                installation_count=len(installations),
+                repository_count=len(choices),
+            )
+            response = HTMLResponse(
+                render_cms_discovery_page(
+                    state_token, tuple(choices), worker_settings.github_app_slug
+                )
+            )
+            app.state.setup_sessions.attach(
+                response,
+                access_token.access_token,
+                oauth_state.nonce,
+                scope="discovery",
+            )
+            return response
 
         async def build_logged_cms_migration_preview(
             repository: GitHubRepository,
@@ -836,13 +1165,17 @@ def create_app(
 
         async def cms_enablement_repository_callback(
             oauth_state: OAuthState,
-            code: str,
+            authorization: str | SetupSession,
         ) -> HTMLResponse:
-            """Render branches after repository access is proven with a fresh user token."""
+            """Render branches after proving the setup user's current repository access."""
             assert oauth_state.repository_id is not None
             assert oauth_state.installation_id is not None
-            access_token = await app.state.github_client.exchange_authorization_code(
-                code, oauth_state.repository_id
+            access_token = (
+                authorization
+                if isinstance(authorization, SetupSession)
+                else await app.state.github_client.exchange_authorization_code(
+                    authorization, oauth_state.repository_id
+                )
             )
             github_user = await app.state.github_client.get_authenticated_user(
                 access_token.access_token
@@ -866,7 +1199,11 @@ def create_app(
             ):
                 raise WorkerError
             branch_selection = app.state.state_manager.issue_cms_enablement_repository(
-                repository.id, oauth_state.installation_id
+                repository.id,
+                oauth_state.installation_id,
+                correlation_nonce=(
+                    authorization.nonce if isinstance(authorization, SetupSession) else None
+                ),
             )
             log_event(
                 logger,
@@ -893,18 +1230,29 @@ def create_app(
                 )
             )
             app.state.state_manager.attach_correlation_cookie(response, branch_selection)
+            app.state.setup_sessions.attach(
+                response,
+                access_token.access_token,
+                branch_selection.correlation_nonce,
+                installation_id=oauth_state.installation_id,
+                repository_id=repository.id,
+            )
             return response
 
         async def cms_enablement_branch_callback(
             oauth_state: OAuthState,
-            code: str,
+            authorization: str | SetupSession,
         ) -> HTMLResponse:
             """Render a verified engine-produced plan for the creator-selected repository branch."""
             assert oauth_state.repository_id is not None
             assert oauth_state.installation_id is not None
             assert oauth_state.target_branch is not None
-            access_token = await app.state.github_client.exchange_authorization_code(
-                code, oauth_state.repository_id
+            access_token = (
+                authorization
+                if isinstance(authorization, SetupSession)
+                else await app.state.github_client.exchange_authorization_code(
+                    authorization, oauth_state.repository_id
+                )
             )
             github_user = await app.state.github_client.get_authenticated_user(
                 access_token.access_token
@@ -958,6 +1306,9 @@ def create_app(
                 preview.engine_selector,
                 preview.engine_commit_sha,
                 _migration_plan_digest(preview),
+                correlation_nonce=(
+                    authorization.nonce if isinstance(authorization, SetupSession) else None
+                ),
             )
             response = HTMLResponse(
                 render_cms_migration_summary_page(
@@ -975,7 +1326,7 @@ def create_app(
 
         async def cms_enablement_confirmation_callback(
             oauth_state: OAuthState,
-            code: str,
+            authorization: str | SetupSession,
         ) -> HTMLResponse:
             """Revalidate a reviewed plan, then create its one atomic migration pull request."""
             assert oauth_state.repository_id is not None
@@ -984,8 +1335,12 @@ def create_app(
             assert oauth_state.base_commit_sha is not None
             assert oauth_state.engine_selector is not None
             assert oauth_state.engine_commit_sha is not None
-            access_token = await app.state.github_client.exchange_authorization_code(
-                code, oauth_state.repository_id
+            access_token = (
+                authorization
+                if isinstance(authorization, SetupSession)
+                else await app.state.github_client.exchange_authorization_code(
+                    authorization, oauth_state.repository_id
+                )
             )
             github_user = await app.state.github_client.get_authenticated_user(
                 access_token.access_token

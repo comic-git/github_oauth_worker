@@ -132,6 +132,7 @@ For later owner runs, select an existing normal stack instead of initializing it
 After GitHub App registration, update the stack to `serviceMode=ready` with `publicBaseUrl`,
 `githubAppClientId`, and Pulumi secret values for the App client secret and state-signing secret.
 That update creates Secret Manager versions and injects them into the Cloud Run revision.
+Set the non-secret `githubAppSlug` to the slug in the App's GitHub public link to enable the guided `/setup` page's **Add repository access** action. Until it is set, existing App-install redirects still work, but `/setup` cannot link users to the App's installation screen.
 
 Both normal-stack files define the CMS engine-selector policy passed to their Cloud Run revision. `cmsMinimumEngineVersion` is the lowest released `X.Y` or `X.Y.Z` engine selector the worker will accept. `cmsAllowedEngineBranches` is the comma-separated list of moving official engine branches it will accept. Keep production limited to release-quality branches such as `latest,master`; test may include controlled development branches such as `cms`.
 

@@ -98,6 +98,7 @@ environment_variables = [
 if service_mode == "ready":
     public_base_url = config.require("publicBaseUrl")
     github_app_client_id = config.require("githubAppClientId")
+    github_app_slug = config.get("githubAppSlug")
     github_app_client_secret = config.require_secret("githubAppClientSecret")
     state_signing_secret = config.require_secret("stateSigningSecret")
     github_secret_id = secret_id(environment, "github-app-client-secret")
@@ -148,6 +149,12 @@ if service_mode == "ready":
             ),
         ]
     )
+    if github_app_slug:
+        environment_variables.append(
+            gcp.cloudrunv2.ServiceTemplateContainerEnvArgs(
+                name="GITHUB_APP_SLUG", value=github_app_slug
+            )
+        )
 
 service_name = f"github-oauth-worker-{environment}"
 service = gcp.cloudrunv2.Service(

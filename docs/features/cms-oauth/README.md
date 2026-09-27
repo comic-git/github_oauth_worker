@@ -7,7 +7,7 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 ## Goals
 
 - Give Decap editors a GitHub App user token with only the App's installed repositories and granted permissions.
-- Turn a verified GitHub App installation into a reviewable, engine-owned CMS migration pull request so creators can enable CMS without manually converting legacy content.
+- Let creators start at the worker's `/setup` URL, connect a repository to the GitHub App when needed, and review an engine-owned CMS migration pull request without manually converting legacy content.
 - Make shared hosting and independent self-hosting practical without source changes.
 - Default to a GitHub-login whitelist for self-hosted workers, with a policy seam that can later support paid access.
 - Keep the public service stateless, inexpensive, and safe to operate at low traffic.
@@ -15,7 +15,7 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 ## Non-Goals
 
 - Reimplement comic content migration, parse TOML independently, or reproduce the engine's CMS compatibility validation.
-- Store editor sessions or GitHub tokens after a request completes.
+- Store editor sessions or GitHub tokens server-side. CMS enablement may use only a short-lived encrypted, HttpOnly browser cookie for its interactive setup steps; normal Decap login does not create a worker session.
 - Provide a general GitHub proxy or repository API.
 - Bypass GitHub App owner consent, repository selection, or an explicit creator confirmation before writing a migration pull request.
 
@@ -30,6 +30,7 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 
 ## Deferred Work
 
+- Make `/setup` classify the selected branch before planning a migration: legacy INI, migrated TOML with retained INI, TOML without INI, already CMS-enabled, and invalid or partial configurations. Treat a valid already-enabled branch as a successful no-op and allow a TOML-ready branch to enable CMS without rerunning TOML migration. Do not classify every repository containing TOML as successfully enabled.
 - Provision a global external Application Load Balancer for the production worker before assigning its custom domain.
 - Map the production worker to a stable custom domain such as `oauth.comic-git.com`. Manage the domain, TLS, DNS records, load-balancer routing, and worker public URL through the production infrastructure configuration before publishing that URL to users.
 - On App installation or update, validate and reconcile worker-owned CMS configuration so reinstalling the App repairs incorrect repository, branch, or worker endpoint settings. Evaluate other narrowly scoped, safe automatic repairs separately.
@@ -40,3 +41,4 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 - [Worker contract](worker-contract.md) - Decap endpoints, security rules, access policy, and deployment/bootstrap boundary.
 - [GitHub App registration](github-app-registration.md) - Versioned App settings, permissions, setup/update verification, and policy boundaries.
 - [CMS enablement](cms-enablement.md) - Creator-facing installation and migration behavior.
+- [CMS setup manual verification](setup-manual-verification.md) - Numbered page-flow checks for installed, new, recovery, and PR lifecycle cases.

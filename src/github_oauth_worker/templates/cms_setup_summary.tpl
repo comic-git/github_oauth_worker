@@ -21,4 +21,5 @@
 <tbody>{% for change in changes %}<tr><td>{{ change.path }}</td><td>{{ change.kind.value|capitalize }}</td></tr>{% endfor %}</tbody></table>
 {% else %}<p>{% if superseded_pull_requests %}No file changes. Older migration pull requests will be closed and their unused branches deleted.{% elif existing_pull_request_url %}No file changes. The pull request's recorded engine commit will be refreshed.{% else %}No migration file changes are needed.{% endif %}</p>{% endif %}
 {% if not up_to_date %}<form action="/setup/confirm" method="post"><p><input type="hidden" name="state" value="{{ state_token }}"><button type="submit">{% if existing_pull_request_url %}Update migration pull request{% else %}Create migration pull request{% endif %}</button></p></form>{% endif %}
+<form action="/setup/switch-account" method="post"><p><button type="submit">Use another GitHub account</button></p></form>
 </main></body></html>

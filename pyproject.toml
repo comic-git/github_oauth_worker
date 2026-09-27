@@ -9,6 +9,7 @@ description = "GitHub App OAuth worker for comic_git Decap CMS sites."
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
+    "cryptography>=50,<51",
     "fastapi>=0.115,<1",
     "google-cloud-firestore>=2.30,<3",
     "google-cloud-logging>=3.16,<4",

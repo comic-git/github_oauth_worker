@@ -27,6 +27,13 @@ def test_whitelist_is_casefolded_and_uses_comma_separated_config() -> None:
     assert settings.github_login_whitelist == frozenset({"marco", "editor"})
 
 
+def test_github_app_slug_is_a_single_url_path_segment() -> None:
+    assert WorkerSettings(github_app_slug="comic-git-test").github_app_slug == "comic-git-test"
+    for invalid in ("", "../other", "other/installations/new", "other?state=unsafe"):
+        with pytest.raises(ValidationError, match="GITHUB_APP_SLUG"):
+            WorkerSettings(github_app_slug=invalid)
+
+
 def test_cms_engine_policy_preserves_branch_names_and_accepts_canonical_minimum_version() -> None:
     settings = WorkerSettings(
         cms_minimum_engine_version="1.2.3",

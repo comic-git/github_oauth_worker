@@ -14,6 +14,30 @@ def render_cms_setup_start_page(installation_id: int) -> str:
     return render_template("cms_setup_start.tpl", installation_id=installation_id)
 
 
+def render_cms_setup_landing_page() -> str:
+    """Introduce CMS setup before a creator has installed or selected an App repository."""
+    return render_template("cms_setup_landing.tpl")
+
+
+def render_cms_discovery_page(
+    state_token: str,
+    repositories: tuple[tuple[int, GitHubRepository], ...],
+    github_app_slug: str | None,
+) -> str:
+    """Show verified installed repositories and a route to grant access to another one."""
+    install_url = (
+        f"https://github.com/apps/{github_app_slug}/installations/new"
+        if github_app_slug is not None
+        else None
+    )
+    return render_template(
+        "cms_setup_discovery.tpl",
+        state_token=state_token,
+        repositories=repositories,
+        install_url=install_url,
+    )
+
+
 def render_cms_repository_selection_page(
     state_token: str,
     installation_id: int,

@@ -89,6 +89,7 @@ class PulumiProgramTests(unittest.TestCase):
                 "github-oauth-worker-infra:serviceMode": "ready",
                 "github-oauth-worker-infra:publicBaseUrl": "https://worker.example.test",
                 "github-oauth-worker-infra:githubAppClientId": "client-id",
+                "github-oauth-worker-infra:githubAppSlug": "test-comic-git",
                 "github-oauth-worker-infra:githubAppClientSecret": "client-secret",
                 "github-oauth-worker-infra:stateSigningSecret": "state-secret",
             },
@@ -101,6 +102,9 @@ class PulumiProgramTests(unittest.TestCase):
             mocks.resource_types.count("gcp:secretmanager/secretVersion:SecretVersion"),
             2,
         )
+        service_inputs = mocks.resource_inputs["github-oauth-worker-test"]
+        self.assertIn("GITHUB_APP_SLUG", str(service_inputs))
+        self.assertIn("test-comic-git", str(service_inputs))
 
     def test_bootstrap_program_builds_environment_boundaries(self) -> None:
         mocks = self._run_program(

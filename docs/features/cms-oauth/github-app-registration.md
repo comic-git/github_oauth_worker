@@ -45,11 +45,9 @@ accident.
 
 ## Setup and Update Verification
 
-1. Install the App for one explicitly selected test repository.
-2. After CMS enablement is implemented, confirm GitHub redirects to `<WORKER_BASE_URL>/setup?installation_id=...` and the worker presents CMS enablement guidance rather than an empty page.
-3. Complete fresh user authorization, select the verified repository, review the migration summary, and explicitly create the generated pull request.
-4. Change the installation's repository selection, then confirm GitHub redirects to the Setup URL again because **Redirect on update** is enabled.
-5. Confirm the worker rejects a manually altered `installation_id` unless the newly authorized user token proves access to that installation and selected repository.
+Set the worker's `githubAppSlug` configuration to the slug from the App's public link so `/setup` can direct users to its GitHub installation screen. The App client ID does not provide an installation URL.
+
+Run the [CMS setup manual verification checklist](setup-manual-verification.md), especially first installation (B), installation update (C), and direct GitHub installation (D). Check both the normal session-reuse path and the documented authorization fallback. A repository not installed on the App must never be offered as a verified setup choice.
 
 GitHub treats `installation_id` in a setup redirect as untrusted browser input. The worker's
 verification step is mandatory even when GitHub initiated the redirect.

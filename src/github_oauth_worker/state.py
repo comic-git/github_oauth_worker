@@ -20,6 +20,7 @@ class OAuthFlow(StrEnum):
     DECAP = "decap"
     ENROLLMENT = "enrollment"
     SETUP = "setup"
+    CMS_ENABLEMENT_DISCOVERY = "cms_enablement_discovery"
     CMS_ENABLEMENT_INSTALLATION = "cms_enablement_installation"
     CMS_ENABLEMENT_REPOSITORY = "cms_enablement_repository"
     CMS_ENABLEMENT_BRANCH = "cms_enablement_branch"
@@ -52,6 +53,17 @@ class OAuthState(BaseModel):
             raise ValueError("This OAuth state requires a bound origin and repository context.")
         if self.flow is OAuthFlow.SETUP and (self.origin is None or self.installation_id is None):
             raise ValueError("Setup OAuth state requires an origin and installation context.")
+        if self.flow is OAuthFlow.CMS_ENABLEMENT_DISCOVERY and (
+            self.origin is not None
+            or self.target_origin is not None
+            or self.repository_id is not None
+            or self.installation_id is not None
+            or self.base_commit_sha is not None
+            or self.engine_selector is not None
+            or self.engine_commit_sha is not None
+            or self.reviewed_plan_digest is not None
+        ):
+            raise ValueError("CMS discovery state must not select an installation or repository.")
         if self.flow is OAuthFlow.CMS_ENABLEMENT_INSTALLATION and (
             self.origin is not None
             or self.repository_id is not None
@@ -201,12 +213,14 @@ class OAuthStateManager:
         self,
         repository_id: int,
         installation_id: int,
+        correlation_nonce: str | None = None,
     ) -> IssuedOAuthState:
         """Bind CMS migration authorization to the selected repository and App installation."""
         return self._issue_without_origin(
             OAuthFlow.CMS_ENABLEMENT_REPOSITORY,
             installation_id,
             repository_id,
+            correlation_nonce=correlation_nonce,
         )
 
     def issue_cms_enablement_confirmation(
@@ -218,6 +232,7 @@ class OAuthStateManager:
         engine_selector: str,
         engine_commit_sha: str,
         reviewed_plan_digest: str,
+        correlation_nonce: str | None = None,
     ) -> IssuedOAuthState:
         """Bind confirmation to the exact reviewed target revision and engine source revision."""
         return self._issue_without_origin(
@@ -229,6 +244,7 @@ class OAuthStateManager:
             engine_selector=engine_selector,
             engine_commit_sha=engine_commit_sha,
             reviewed_plan_digest=reviewed_plan_digest,
+            correlation_nonce=correlation_nonce,
         )
 
     def issue_cms_enablement_branch(
@@ -236,13 +252,15 @@ class OAuthStateManager:
         repository_id: int,
         installation_id: int,
         target_branch: str,
+        correlation_nonce: str | None = None,
     ) -> IssuedOAuthState:
-        """Bind fresh CMS migration planning authorization to the creator-selected branch."""
+        """Bind CMS migration planning to the creator-selected branch."""
         return self._issue_without_origin(
             OAuthFlow.CMS_ENABLEMENT_BRANCH,
             installation_id,
             repository_id,
             target_branch=target_branch,
+            correlation_nonce=correlation_nonce,
         )
 
     def issue_origin_migration(
@@ -359,9 +377,10 @@ class OAuthStateManager:
         engine_selector: str | None = None,
         engine_commit_sha: str | None = None,
         reviewed_plan_digest: str | None = None,
+        correlation_nonce: str | None = None,
     ) -> IssuedOAuthState:
         """Sign a direct GitHub App setup flow that deliberately has no CMS browser origin."""
-        correlation_nonce = secrets.token_urlsafe(32)
+        correlation_nonce = correlation_nonce or secrets.token_urlsafe(32)
         state = OAuthState(
             flow=flow,
             nonce=correlation_nonce,

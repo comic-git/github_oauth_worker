@@ -14,6 +14,8 @@ Run the normal offline suite and static checks from the local venv:
 
 The bootstrap test verifies the health endpoint and confirms OAuth routes are unavailable before configuration exists.
 
+For a deployed test App, use the [numbered CMS setup manual verification checklist](features/cms-oauth/setup-manual-verification.md) to report the exact page and step where a browser flow differs from expectations.
+
 ## Test Structure
 
 The planned layout is:

@@ -72,6 +72,16 @@ def test_verify_bound_access_requires_both_installation_and_repository() -> None
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/user/installations":
                 return httpx.Response(200, json={"installations": [{"id": 44}]})
+            if request.url.path == "/user/installations/44/repositories":
+                return httpx.Response(
+                    200,
+                    json={
+                        "total_count": 1,
+                        "repositories": [
+                            {"id": 123, "name": "comic", "owner": {"login": "owner"}}
+                        ],
+                    },
+                )
             if request.url.path == "/repositories/123":
                 return httpx.Response(
                     200,
@@ -92,6 +102,12 @@ def test_verify_bound_access_requires_both_installation_and_repository() -> None
                 SecretStr("user-access-token"),
                 installation_id=45,
                 repository_id=123,
+            )
+        with pytest.raises(GitHubAccessVerificationError):
+            await client.verify_bound_repository_access(
+                SecretStr("user-access-token"),
+                installation_id=44,
+                repository_id=999,
             )
 
     asyncio.run(scenario())

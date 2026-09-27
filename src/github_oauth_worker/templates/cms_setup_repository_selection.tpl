@@ -7,4 +7,6 @@
 <label><input type="radio" name="repository_id" value="{{ repository.id }}" required> {{ repository.owner.login }}/{{ repository.name }}</label><br>
 {% endfor %}
 <p><button type="submit">Review CMS migration</button></p>
-</form></main></body></html>
+</form>
+<form action="/setup/switch-account" method="post"><p><button type="submit">Use another GitHub account</button></p></form>
+</main></body></html>

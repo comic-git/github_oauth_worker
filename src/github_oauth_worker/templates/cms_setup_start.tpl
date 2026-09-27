@@ -9,6 +9,7 @@
     <input type="hidden" name="installation_id" value="{{ installation_id }}">
     <button type="submit">Continue</button>
   </form>
+  <form action="/setup/switch-account" method="post"><p><button type="submit">Use another GitHub account</button></p></form>
 </main>
 </body>
 </html>

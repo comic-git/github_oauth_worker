@@ -69,6 +69,7 @@ class WorkerSettings(BaseSettings):
     firestore_database_id: str = "test"
     public_base_url: HttpUrl | None = None
     github_app_client_id: str | None = None
+    github_app_slug: str | None = None
     github_app_client_secret: SecretStr | None = None
     state_signing_secret: SecretStr | None = None
     access_policy: AccessPolicyMode = AccessPolicyMode.GITHUB_LOGIN_WHITELIST
@@ -122,6 +123,14 @@ class WorkerSettings(BaseSettings):
             raise ValueError(
                 "CMS_MINIMUM_ENGINE_VERSION must be a canonical X.Y or X.Y.Z version."
             )
+        return value
+
+    @field_validator("github_app_slug")
+    @classmethod
+    def require_github_app_slug(cls, value: str | None) -> str | None:
+        """Accept only a GitHub App URL path segment for the guided install link."""
+        if value is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", value):
+            raise ValueError("GITHUB_APP_SLUG must be a GitHub App slug.")
         return value
 
     @field_validator("public_base_url")

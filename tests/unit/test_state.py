@@ -119,6 +119,8 @@ def _issue_state(state_manager: OAuthStateManager, flow: OAuthFlow):
         return state_manager.issue_enrollment("https://cms.example.com")
     if flow is OAuthFlow.SETUP:
         return state_manager.issue_setup("https://cms.example.com", 123, 456)
+    if flow is OAuthFlow.CMS_ENABLEMENT_DISCOVERY:
+        return state_manager.issue(OAuthFlow.CMS_ENABLEMENT_DISCOVERY)
     if flow is OAuthFlow.CMS_ENABLEMENT_INSTALLATION:
         return state_manager.issue_cms_enablement_installation(456)
     if flow is OAuthFlow.CMS_ENABLEMENT_REPOSITORY:

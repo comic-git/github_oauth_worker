@@ -9,4 +9,6 @@
 {% for branch in branches %}<option value="{{ branch.name }}"{% if branch.name == repository.default_branch %} selected{% endif %}>{{ branch.name }}</option>{% endfor %}
 </select>
 <button type="submit">Review CMS migration</button>
-</form></main></body></html>
+</form>
+<form action="/setup/switch-account" method="post"><p><button type="submit">Use another GitHub account</button></p></form>
+</main></body></html>
