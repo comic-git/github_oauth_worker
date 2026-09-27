@@ -14,7 +14,7 @@ The worker reads the target's validated `engine.version` selector, resolves it o
 
 ## Decap Authorization
 
-`GET /auth`, `GET /callback`, and `POST /auth/refresh` implement Decap's GitHub authentication contract. The initial popup handshake captures the actual `MessageEvent.origin` of the CMS opener. The worker uses that origin to look up an active binding; it never treats Decap's `site_id` query parameter as proof of origin ownership.
+`GET /auth`, `GET /callback`, and `POST /auth/refresh` implement Decap's GitHub authentication contract. The initial popup handshake captures the actual `MessageEvent.origin` of the CMS opener and submits it with a same-origin browser form so the GitHub authorization redirect navigates the popup rather than a `fetch()` request. The worker uses that origin to look up an active binding; it never treats Decap's `site_id` query parameter as proof of origin ownership.
 
 A successful callback sends `authorization:github:success:<json>` from the worker origin to the exact active CMS origin captured in signed state. Error callbacks use the same exact target. The worker must never use `postMessage(..., '*')` for a token-bearing result.
 

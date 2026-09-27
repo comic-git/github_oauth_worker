@@ -14,11 +14,16 @@ from pydantic import SecretStr
 
 from github_oauth_worker.cms_enablement import (
     CmsEnablementError,
+    CmsMigrationPreview,
     EngineMigrationContract,
     MaterializedEngine,
+    MigrationFileChangeKind,
+    MigrationPlanFile,
+    compare_migration_files,
     decode_text_blob,
     extract_official_engine_archive,
     materialize_target_snapshot,
+    migration_branch_name,
     parse_engine_selector,
     parse_runner_plan,
     read_target_repository_state,
@@ -39,6 +44,115 @@ from github_oauth_worker.github_client import (
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
+
+
+def test_migration_branch_name_is_stable_for_a_target_revision() -> None:
+    assert migration_branch_name("cms", SHA_A) == migration_branch_name("cms", SHA_A)
+    assert migration_branch_name("cms", SHA_A) != migration_branch_name("main", SHA_A)
+    assert migration_branch_name("cms", SHA_A) != migration_branch_name("cms", SHA_B)
+
+
+def test_migration_review_compares_proposed_files_with_existing_pr_branch() -> None:
+    def entry(path: str, sha: str, size: int = 4) -> GitHubGitTreeEntry:
+        return GitHubGitTreeEntry(path=path, mode="100644", type="blob", sha=sha, size=size)
+
+    class BlobClient:
+        async def get_repository_blob(self, _token, _repository, sha):
+            assert sha == SHA_C
+            return GitHubGitBlob(
+                sha=sha, content=base64.b64encode(b"old\n").decode(), encoding="base64"
+            )
+
+    base = GitHubGitTree(
+        sha=SHA_A,
+        tree=(entry("your_content/restored.toml", SHA_A),),
+    )
+    current = GitHubGitTree(
+        sha=SHA_B,
+        tree=(
+            entry("your_content/restored.toml", SHA_B),
+            entry("your_content/updated.toml", SHA_C),
+            entry("your_content/removed.toml", SHA_B),
+        ),
+    )
+    preview = CmsMigrationPreview(
+        base_commit_sha=SHA_A,
+        target_branch="cms",
+        engine_selector="cms",
+        engine_commit_sha=SHA_B,
+        changed_paths=("your_content/updated.toml", "your_content/added.toml"),
+        files=(
+            MigrationPlanFile("your_content/updated.toml", "new\n"),
+            MigrationPlanFile("your_content/added.toml", "new\n"),
+        ),
+    )
+    changes = asyncio.run(
+        compare_migration_files(
+            BlobClient(),
+            SecretStr("token"),
+            GitHubRepository(id=123, name="comic", owner=GitHubRepositoryOwner(login="owner")),
+            base,
+            current,
+            preview,
+        )
+    )
+
+    assert [(change.path, change.kind) for change in changes] == [
+        ("your_content/added.toml", MigrationFileChangeKind.ADDED),
+        ("your_content/removed.toml", MigrationFileChangeKind.REMOVED),
+        ("your_content/restored.toml", MigrationFileChangeKind.UPDATED),
+        ("your_content/updated.toml", MigrationFileChangeKind.UPDATED),
+    ]
+
+
+def test_migration_review_replaces_unreadable_generated_files_on_pr_branch() -> None:
+    paths = (
+        "your_content/symlink.toml",
+        "your_content/oversized.toml",
+        "your_content/binary.toml",
+    )
+
+    class BlobClient:
+        async def get_repository_blob(self, _token, _repository, sha):
+            assert sha == SHA_C
+            return GitHubGitBlob(
+                sha=sha,
+                content=base64.b64encode(b"\xff").decode(),
+                encoding="base64",
+            )
+
+    current = GitHubGitTree(
+        sha=SHA_B,
+        tree=(
+            GitHubGitTreeEntry(path=paths[0], mode="120000", type="blob", sha=SHA_A, size=4),
+            GitHubGitTreeEntry(
+                path=paths[1], mode="100644", type="blob", sha=SHA_B, size=2_000_000
+            ),
+            GitHubGitTreeEntry(path=paths[2], mode="100644", type="blob", sha=SHA_C, size=1),
+        ),
+    )
+    preview = CmsMigrationPreview(
+        base_commit_sha=SHA_A,
+        target_branch="cms",
+        engine_selector="cms",
+        engine_commit_sha=SHA_B,
+        changed_paths=paths,
+        files=tuple(MigrationPlanFile(path, "replacement\n") for path in paths),
+    )
+    changes = asyncio.run(
+        compare_migration_files(
+            BlobClient(),
+            SecretStr("token"),
+            GitHubRepository(id=123, name="comic", owner=GitHubRepositoryOwner(login="owner")),
+            GitHubGitTree(sha=SHA_A, tree=()),
+            current,
+            preview,
+        )
+    )
+
+    assert [(change.path, change.kind) for change in changes] == [
+        (path, MigrationFileChangeKind.UPDATED) for path in sorted(paths)
+    ]
 
 
 def test_extract_official_engine_archive_accepts_one_bounded_regular_file_root(

@@ -5,6 +5,7 @@
 <main>
 <h1>{{ heading }}</h1>
 <p>{{ message }}</p>
+{% if retry_url %}<p><a href="{{ retry_url }}">Review latest result</a></p>{% endif %}
 {% if diagnostic_code %}<p>Troubleshooting code: <code>{{ diagnostic_code }}</code></p>{% endif %}
 </main>
 </body>

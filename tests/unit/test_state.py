@@ -127,7 +127,7 @@ def _issue_state(state_manager: OAuthStateManager, flow: OAuthFlow):
         return state_manager.issue_cms_enablement_branch(123, 456, "cms")
     if flow is OAuthFlow.CMS_ENABLEMENT_CONFIRMATION:
         return state_manager.issue_cms_enablement_confirmation(
-            123, 456, "cms", "a" * 40, "cms", "b" * 40
+            123, 456, "cms", "a" * 40, "cms", "b" * 40, "0" * 64
         )
     return state_manager.issue_origin_migration(
         "https://cms.example.com",

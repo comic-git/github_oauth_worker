@@ -1,17 +1,13 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Continue setup</title></head>
-<body><script>
+<body><form id="handshake" action="/setup/handshake" method="post"><input type="hidden" name="origin" id="origin"><input type="hidden" name="installation_id" value="{{ installation_id }}"></form><script>
 (() => {
   const message = "authorizing:github";
-  const receiveHandshake = async (event) => {
+  const receiveHandshake = (event) => {
     if (event.source !== window.opener || event.data !== message) return;
     window.removeEventListener("message", receiveHandshake);
-    const response = await fetch("/setup/handshake", {
-      method: "POST", credentials: "same-origin",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({origin: event.origin, installation_id: {{ installation_id | tojson }}}),
-    });
-    document.body.textContent = await response.text();
+    document.getElementById("origin").value = event.origin;
+    document.getElementById("handshake").submit();
   };
   window.addEventListener("message", receiveHandshake);
   // This initial discovery message has no token, state, or user data.

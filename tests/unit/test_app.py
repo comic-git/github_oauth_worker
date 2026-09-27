@@ -1,25 +1,42 @@
 """Tests for bootstrap and ready-mode application surfaces."""
 
 import asyncio
+import base64
 import logging
 import re
 from urllib.parse import parse_qs, urlparse
 
+import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from github_oauth_worker.app import create_app
+from github_oauth_worker.app import _migration_plan_digest, create_app
 from github_oauth_worker.bindings import BindingStatus, InMemoryBindingStore, RepositoryBinding
 from github_oauth_worker.cms_enablement import (
     CmsEnablementError,
     CmsMigrationPreview,
+    MigrationFileChange,
+    MigrationFileChangeKind,
+    MigrationPlanFile,
     TargetRepositoryState,
+    migration_branch_name,
 )
+from github_oauth_worker.cms_setup import render_cms_migration_summary_page
 from github_oauth_worker.config import AccessPolicyMode, ServiceMode, WorkerSettings
 from github_oauth_worker.errors import WorkerUnavailableError
 from github_oauth_worker.github_client import (
     GitHubAccessVerificationError,
+    GitHubClientError,
+    GitHubGitBlob,
+    GitHubGitCommit,
+    GitHubGitObject,
+    GitHubGitReference,
+    GitHubGitSha,
     GitHubGitTree,
+    GitHubGitTreeEntry,
+    GitHubPullRequest,
+    GitHubPullRequestDetails,
+    GitHubPullRequestRef,
     GitHubRepository,
     GitHubRepositoryBranch,
     GitHubRepositoryOwner,
@@ -100,9 +117,10 @@ def test_ready_callback_requires_cookie_and_verifies_a_bound_repository() -> Non
 
     handshake_response = client.post(
         "/auth/handshake",
-        json={"origin": "https://cms.example.com"},
+        data={"origin": "https://cms.example.com"},
         follow_redirects=False,
     )
+    assert handshake_response.status_code == 302
     state = parse_qs(urlparse(handshake_response.headers["location"]).query)["state"][0]
     cookie_value = handshake_response.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
 
@@ -116,6 +134,26 @@ def test_ready_callback_requires_cookie_and_verifies_a_bound_repository() -> Non
     assert callback_response.status_code == 200
     assert 'const targetOrigin = "https://cms.example.com"' in callback_response.text
     assert "authorization:github:success:" in callback_response.text
+
+
+def test_setup_handshake_form_navigates_to_github_with_cookie_bound_state() -> None:
+    client = TestClient(
+        create_app(
+            _ready_settings(),
+            binding_store=InMemoryBindingStore(),
+            github_client=_FakeGitHubClient(),
+        )
+    )
+
+    response = client.post(
+        "/setup/handshake",
+        data={"origin": "https://cms.example.com", "installation_id": "456"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"].startswith("https://github.com/login/oauth/authorize?")
+    assert "oauth_correlation_setup=" in response.headers["set-cookie"]
 
 
 def test_ready_refresh_requires_a_bound_browser_origin_and_rechecks_github_access() -> None:
@@ -171,9 +209,10 @@ def test_unknown_origin_enrollment_requires_fresh_confirmation_before_binding() 
 
     enrollment_start = client.post(
         "/auth/handshake",
-        json={"origin": "https://new-cms.example.com"},
+        data={"origin": "https://new-cms.example.com"},
         follow_redirects=False,
     )
+    assert enrollment_start.status_code == 302
     enrollment_state = parse_qs(urlparse(enrollment_start.headers["location"]).query)["state"][0]
     enrollment_cookie = enrollment_start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
 
@@ -280,7 +319,7 @@ def test_cms_setup_confirmation_requires_the_reviewed_state_cookie() -> None:
     )
     client = TestClient(app)
     issued = app.state.state_manager.issue_cms_enablement_confirmation(
-        123, 456, "master", "a" * 40, "cms", "b" * 40
+        123, 456, "master", "a" * 40, "cms", "b" * 40, "0" * 64
     )
 
     response = client.post(
@@ -295,6 +334,14 @@ def test_cms_setup_confirmation_requires_the_reviewed_state_cookie() -> None:
 
     assert response.status_code == 302
     assert "repository_id=123" in response.headers["location"]
+    redirected_token = parse_qs(urlparse(response.headers["location"]).query)["state"][0]
+    redirected_cookie = response.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+    redirected = app.state.state_manager.consume(
+        redirected_token,
+        redirected_cookie,
+        expected_flow=OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+    )
+    assert redirected.reviewed_plan_digest == "0" * 64
 
 
 def test_cms_setup_review_uses_the_selected_branch_and_sets_its_confirmation_cookie(
@@ -359,6 +406,8 @@ def test_cms_setup_review_uses_the_selected_branch_and_sets_its_confirmation_coo
 
     assert response.status_code == 200
     assert "Target branch: cms" in response.text
+    assert "Create migration pull request" in response.text
+    assert "Existing pull request" not in response.text
     confirmation_state = re.search('name="state" value="([^"]+)"', response.text)
     assert confirmation_state is not None
     confirmation_cookie = response.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
@@ -368,6 +417,314 @@ def test_cms_setup_review_uses_the_selected_branch_and_sets_its_confirmation_coo
         expected_flow=OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
     )
     assert confirmed.target_branch == "cms"
+    assert confirmed.reviewed_plan_digest is not None
+
+
+def test_cms_setup_review_links_existing_pr_and_shows_incremental_changes(monkeypatch) -> None:
+    base_sha = "a" * 40
+    head_sha = "d" * 40
+    branch_name = migration_branch_name("cms", base_sha)
+
+    async def read_target(*_args: object) -> TargetRepositoryState:
+        return TargetRepositoryState(
+            base_commit_sha=base_sha,
+            target_branch="cms",
+            tree=GitHubGitTree(sha="b" * 40, tree=()),
+            config_path="your_content/comic_info.toml",
+            engine_selector="cms",
+        )
+
+    async def resolve_engine(*_args: object) -> str:
+        return "c" * 40
+
+    async def build_preview(*_args: object) -> CmsMigrationPreview:
+        return CmsMigrationPreview(
+            base_commit_sha=base_sha,
+            target_branch="cms",
+            engine_selector="cms",
+            engine_commit_sha="c" * 40,
+            changed_paths=("your_content/comic_info.toml",),
+            files=(MigrationPlanFile("your_content/comic_info.toml", "new\n"),),
+        )
+
+    class ReviewClient(_FakeGitHubClient):
+        async def list_open_repository_pull_requests(self, token, repository, base):
+            assert base == "cms"
+            return (await self.get_repository_pull_request(token, repository, 4),)
+
+        async def get_repository_pull_request(self, _token, repository, number):
+            assert number == 4
+            return GitHubPullRequestDetails(
+                number=4,
+                html_url="https://github.com/owner/comic/pull/4",
+                state="open",
+                head=GitHubPullRequestRef(ref=branch_name, sha=head_sha, repo=repository),
+                base=GitHubPullRequestRef(ref="cms", sha=base_sha, repo=repository),
+                body=(
+                    "Engine selector: `cms`\n\n"
+                    f"Resolved engine SHA: `{'e' * 40}`\n\nTarget branch: `cms`"
+                ),
+            )
+
+        async def get_repository_ref(self, _token, _repository, ref):
+            assert ref == f"heads/{branch_name}"
+            return GitHubGitReference(
+                ref=f"refs/{ref}", object=GitHubGitObject(type="commit", sha=head_sha)
+            )
+
+        async def get_repository_commit(self, _token, _repository, sha):
+            assert sha == head_sha
+            return GitHubGitCommit(sha=sha, tree=GitHubGitSha(sha="f" * 40))
+
+        async def get_repository_tree(self, _token, _repository, sha):
+            assert sha == "f" * 40
+            return GitHubGitTree(
+                sha=sha,
+                tree=(
+                    GitHubGitTreeEntry(
+                        path="your_content/comic_info.toml",
+                        mode="100644",
+                        type="blob",
+                        sha="1" * 40,
+                        size=4,
+                    ),
+                ),
+            )
+
+        async def get_repository_blob(self, _token, _repository, sha):
+            assert sha == "1" * 40
+            return GitHubGitBlob(sha=sha, content="b2xkCg==", encoding="base64")
+
+    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_target)
+    monkeypatch.setattr("github_oauth_worker.app.resolve_official_engine_commit", resolve_engine)
+    monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=ReviewClient(),
+    )
+    issued = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+    response = TestClient(app).get(
+        f"/callback?code=one-time-code&state={issued.token}",
+        headers={"Cookie": f"{issued.cookie_name}={issued.correlation_nonce}"},
+    )
+
+    assert response.status_code == 200
+    assert "https://github.com/owner/comic/pull/4" in response.text
+    assert "Update migration pull request" in response.text
+    assert '<form action="/setup/confirm" method="post"><p>' in response.text
+    assert "</p></form>" in response.text
+    assert "Create migration pull request" not in response.text
+    assert "your_content/comic_info.toml" in response.text
+    assert "Updated" in response.text
+    confirmation_state = re.search('name="state" value="([^"]+)"', response.text)
+    assert confirmation_state is not None
+    cookie = response.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+    confirmed = app.state.state_manager.consume(
+        confirmation_state.group(1),
+        cookie,
+        expected_flow=OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+    )
+    assert confirmed.reviewed_plan_digest is not None
+
+
+def test_cms_review_of_up_to_date_pull_request_has_no_update_action() -> None:
+    preview = CmsMigrationPreview(
+        base_commit_sha="a" * 40,
+        target_branch="cms",
+        engine_selector="cms",
+        engine_commit_sha="b" * 40,
+        changed_paths=("your_content/comic_info.toml",),
+        files=(MigrationPlanFile("your_content/comic_info.toml", "[cms]\n"),),
+    )
+    page = render_cms_migration_summary_page(
+        "signed-state",
+        GitHubRepository(id=123, name="comic", owner=GitHubRepositoryOwner(login="owner")),
+        preview,
+        (MigrationFileChange("your_content/comic_info.toml", MigrationFileChangeKind.UPDATED),),
+        "https://github.com/owner/comic/pull/4",
+        up_to_date=True,
+    )
+
+    assert "https://github.com/owner/comic/pull/4" in page
+    assert "The migration pull request is up to date." in page
+    assert "Update migration pull request" not in page
+    assert "Create migration pull request" not in page
+
+
+@pytest.mark.parametrize("branch_state", ["missing", "orphan", "closed_pr"])
+@pytest.mark.parametrize("cleanup_state", ["deleted", "shared", "failed"])
+def test_cms_setup_replaces_old_target_revision_pr_after_new_pr_exists(
+    monkeypatch, branch_state: str, cleanup_state: str
+) -> None:
+    old_base = "a" * 40
+    new_base = "b" * 40
+    old_branch = migration_branch_name("cms", old_base)
+    new_branch = migration_branch_name("cms", new_base)
+    selected_branch = f"{new_branch}-1" if branch_state == "closed_pr" else new_branch
+
+    async def read_target(*_args: object) -> TargetRepositoryState:
+        return TargetRepositoryState(
+            base_commit_sha=new_base,
+            target_branch="cms",
+            tree=GitHubGitTree(sha="c" * 40, tree=()),
+            config_path="your_content/comic_info.toml",
+            engine_selector="cms",
+        )
+
+    async def resolve_engine(*_args: object) -> str:
+        return "d" * 40
+
+    async def build_preview(*_args: object) -> CmsMigrationPreview:
+        return CmsMigrationPreview(
+            base_commit_sha=new_base,
+            target_branch="cms",
+            engine_selector="cms",
+            engine_commit_sha="d" * 40,
+            changed_paths=("your_content/comic_info.toml",),
+            files=(MigrationPlanFile("your_content/comic_info.toml", "[cms]\n"),),
+        )
+
+    class ReplacementClient(_FakeGitHubClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+            self.old_closed = False
+
+        async def list_open_repository_pull_requests(self, _token, repository, base):
+            assert base == "cms"
+            return (
+                ()
+                if self.old_closed
+                else (
+                    GitHubPullRequestDetails(
+                        number=4,
+                        html_url="https://github.com/owner/comic/pull/4",
+                        state="open",
+                        head=GitHubPullRequestRef(ref=old_branch, sha="e" * 40, repo=repository),
+                        base=GitHubPullRequestRef(ref="cms", sha=old_base, repo=repository),
+                    ),
+                )
+            )
+
+        async def find_repository_ref(self, _token, _repository, ref):
+            assert ref in {f"heads/{new_branch}", f"heads/{selected_branch}"}
+            return (
+                GitHubGitReference(
+                    ref=f"refs/{ref}", object=GitHubGitObject(type="commit", sha="8" * 40)
+                )
+                if ref == f"heads/{new_branch}" and branch_state != "missing"
+                else None
+            )
+
+        async def list_repository_pull_requests_for_head(self, _token, _repository, branch):
+            if branch == old_branch:
+                assert self.old_closed
+                return (
+                    GitHubPullRequest(
+                        number=7,
+                        html_url="https://github.com/owner/comic/pull/7",
+                        state="open",
+                    ),
+                ) if cleanup_state == "shared" else ()
+            assert branch == new_branch
+            return (
+                GitHubPullRequest(
+                    number=6,
+                    html_url="https://github.com/owner/comic/pull/6",
+                    state="closed",
+                ),
+            ) if branch_state == "closed_pr" else ()
+
+        async def get_repository_ref(self, _token, _repository, ref):
+            assert ref == f"heads/{new_branch}"
+            return GitHubGitReference(
+                ref=f"refs/{ref}", object=GitHubGitObject(type="commit", sha="8" * 40)
+            )
+
+        async def get_repository_commit(self, _token, _repository, sha):
+            assert sha == "8" * 40
+            return GitHubGitCommit(sha=sha, tree=GitHubGitSha(sha="1" * 40))
+
+        async def get_repository_tree(self, _token, _repository, sha):
+            assert sha == "1" * 40
+            return GitHubGitTree(sha=sha, tree=())
+
+        async def create_repository_blobs(self, _token, _repository, changes):
+            return ((changes[0], "f" * 40),)
+
+        async def create_repository_tree(self, _token, _repository, base_tree_sha, _blobs):
+            assert base_tree_sha == "c" * 40
+            return GitHubGitTree(sha="1" * 40, tree=())
+
+        async def create_repository_commit(self, _token, _repository, _message, tree, parent):
+            assert tree == "1" * 40
+            assert parent == new_base
+            return GitHubGitCommit(sha="2" * 40, tree=GitHubGitSha(sha=tree))
+
+        async def create_repository_branch(self, _token, _repository, name, _sha):
+            assert name == selected_branch
+            self.events.append("branch_created")
+
+        async def create_repository_pull_request(self, _token, _repository, *args):
+            assert args[2] == selected_branch
+            self.events.append("pr_created")
+            return GitHubPullRequest(
+                number=5, html_url="https://github.com/owner/comic/pull/5", state="open"
+            )
+
+        async def close_repository_pull_request(self, _token, _repository, number):
+            assert number == 4
+            self.events.append("old_pr_closed")
+            self.old_closed = True
+
+        async def delete_repository_branch(self, _token, _repository, branch):
+            assert branch == old_branch
+            if cleanup_state == "failed":
+                self.events.append("old_branch_delete_failed")
+                raise GitHubClientError
+            self.events.append("old_branch_deleted")
+
+    fake = ReplacementClient()
+    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_target)
+    monkeypatch.setattr("github_oauth_worker.app.resolve_official_engine_commit", resolve_engine)
+    monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
+    app = create_app(_ready_settings(), binding_store=InMemoryBindingStore(), github_client=fake)
+    reviewed = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+    review = TestClient(app).get(
+        f"/callback?code=one-time-code&state={reviewed.token}",
+        headers={"Cookie": f"{reviewed.cookie_name}={reviewed.correlation_nonce}"},
+    )
+    assert review.status_code == 200
+    assert "https://github.com/owner/comic/pull/4" in review.text
+    assert "will be closed" in review.text
+    assert fake.events == []
+
+    confirmation = app.state.state_manager.issue_cms_enablement_confirmation(
+        123,
+        456,
+        "cms",
+        new_base,
+        "cms",
+        "d" * 40,
+        _migration_plan_digest(asyncio.run(build_preview())),
+    )
+    result = TestClient(app).get(
+        f"/callback?code=one-time-code&state={confirmation.token}",
+        headers={"Cookie": f"{confirmation.cookie_name}={confirmation.correlation_nonce}"},
+    )
+    assert result.status_code == 200
+    assert "https://github.com/owner/comic/pull/5" in result.text
+    expected_events = [] if branch_state == "orphan" else ["branch_created"]
+    expected_events.extend(["pr_created", "old_pr_closed"])
+    if cleanup_state != "shared":
+        expected_events.append(
+            "old_branch_deleted" if cleanup_state == "deleted" else "old_branch_delete_failed"
+        )
+    assert fake.events == expected_events
+    assert ("could not remove" in result.text) is (cleanup_state == "failed")
+    if cleanup_state == "failed":
+        assert old_branch in result.text
 
 
 def test_cms_branch_callback_returns_a_safe_page_for_a_migration_error(monkeypatch) -> None:
@@ -461,7 +818,7 @@ def test_cms_setup_callback_renders_a_safe_error_without_a_decap_origin() -> Non
     )
     client = TestClient(app)
     issued = app.state.state_manager.issue_cms_enablement_confirmation(
-        123, 456, "master", "a" * 40, "cms", "b" * 40
+        123, 456, "master", "a" * 40, "cms", "b" * 40, "0" * 64
     )
 
     response = client.get(
@@ -471,6 +828,238 @@ def test_cms_setup_callback_renders_a_safe_error_without_a_decap_origin() -> Non
 
     assert response.status_code == 400
     assert "The request could not be completed." in response.text
+
+
+@pytest.mark.parametrize(
+    "branch_changed,interrupt_after_branch,edited_body,plan_changed,race",
+    [
+        (False, False, False, False, False),
+        (True, False, False, False, False),
+        (False, True, False, False, False),
+        (False, False, True, False, False),
+        (False, False, False, True, False),
+        (False, False, False, False, True),
+    ],
+)
+def test_cms_setup_revises_an_untouched_existing_pull_request(
+    monkeypatch,
+    branch_changed: bool,
+    interrupt_after_branch: bool,
+    edited_body: bool,
+    plan_changed: bool,
+    race: bool,
+) -> None:
+    base_sha = "a" * 40
+    old_head = "c" * 40
+    new_head = "3" * 40
+    new_engine = "e" * 40
+    branch_name = migration_branch_name("cms", base_sha)
+
+    async def read_target(*_args: object) -> TargetRepositoryState:
+        return TargetRepositoryState(
+            base_commit_sha=base_sha,
+            target_branch="cms",
+            tree=GitHubGitTree(sha="b" * 40, tree=()),
+            config_path="your_content/comic_info.toml",
+            engine_selector="cms",
+        )
+
+    async def resolve_engine(*_args: object) -> str:
+        return new_engine
+
+    async def build_preview(*_args: object) -> CmsMigrationPreview:
+        from github_oauth_worker.cms_enablement import MigrationPlanFile
+
+        return CmsMigrationPreview(
+            base_commit_sha=base_sha,
+            target_branch="cms",
+            engine_selector="cms",
+            engine_commit_sha=new_engine,
+            changed_paths=("your_content/comic_info.toml",),
+            files=(MigrationPlanFile("your_content/comic_info.toml", "title = 'New'\n"),),
+        )
+
+    class RevisionClient(_FakeGitHubClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.head_sha = "4" * 40 if branch_changed else old_head
+            self.body = (
+                "Engine selector: `cms`\n\n"
+                f"Resolved engine SHA: `{'d' * 40}`\n\n"
+                "Target branch: `cms`"
+            )
+            if edited_body:
+                self.body += "\n\nManual note"
+            self.updated_body = ""
+            self.fail_body_once = interrupt_after_branch
+            self.race_once = race
+            self.created_pull_requests = 0
+
+        async def list_open_repository_pull_requests(self, token, repository, base):
+            assert base == "cms"
+            return (await self.get_repository_pull_request(token, repository, 4),)
+
+        async def get_repository_pull_request(self, _token, repository, number):
+            assert number == 4
+            head = GitHubPullRequestRef(ref=branch_name, sha=self.head_sha, repo=repository)
+            base = GitHubPullRequestRef(ref="cms", sha=base_sha, repo=repository)
+            return GitHubPullRequestDetails(
+                number=4,
+                html_url="https://github.com/owner/comic/pull/4",
+                state="open",
+                head=head,
+                base=base,
+                body=self.body,
+            )
+
+        async def get_repository_ref(self, _token, _repository, ref):
+            assert ref == f"heads/{branch_name}"
+            return GitHubGitReference(
+                ref=f"refs/{ref}", object=GitHubGitObject(type="commit", sha=self.head_sha)
+            )
+
+        async def get_repository_commit(self, _token, _repository, sha):
+            if sha == new_head:
+                return GitHubGitCommit(
+                    sha=sha,
+                    tree=GitHubGitSha(sha="2" * 40),
+                    message="Refresh comic_git CMS migration",
+                    parents=(GitHubGitSha(sha=old_head),),
+                )
+            assert sha in {old_head, "4" * 40, "6" * 40}
+            return GitHubGitCommit(
+                sha=sha,
+                tree=GitHubGitSha(sha="f" * 40),
+                message="Enable comic_git CMS",
+                parents=(GitHubGitSha(sha=base_sha),),
+            )
+
+        async def get_repository_tree(self, _token, _repository, sha):
+            assert sha in {"f" * 40, "2" * 40}
+            current = sha == "2" * 40
+            return GitHubGitTree(
+                sha=sha,
+                tree=(
+                    GitHubGitTreeEntry(
+                        path="your_content/comic_info.toml",
+                        mode="100644",
+                        type="blob",
+                        sha=("5" if current else "1") * 40,
+                        size=len("title = 'New'\n") if current else 4,
+                    ),
+                ),
+            )
+
+        async def get_repository_blob(self, _token, _repository, sha):
+            contents = "title = 'New'\n" if sha == "5" * 40 else "old\n"
+            return GitHubGitBlob(
+                sha=sha,
+                content=base64.b64encode(contents.encode()).decode(),
+                encoding="base64",
+            )
+
+        async def create_repository_blobs(self, _token, _repository, changes):
+            assert changes[0].content == "title = 'New'\n"
+            return ((changes[0], "1" * 40),)
+
+        async def create_repository_tree(self, _token, _repository, base_tree_sha, _blobs):
+            assert base_tree_sha == "b" * 40
+            return GitHubGitTree(sha="2" * 40, tree=())
+
+        async def create_repository_commit(
+            self, _token, _repository, _message, tree_sha, parent_sha
+        ):
+            assert tree_sha == "2" * 40
+            assert parent_sha == self.head_sha
+            return GitHubGitCommit(sha=new_head, tree=GitHubGitSha(sha=tree_sha))
+
+        async def update_repository_branch(self, _token, _repository, branch, commit_sha):
+            assert branch == branch_name
+            assert commit_sha == new_head
+            if self.race_once:
+                self.race_once = False
+                self.head_sha = "6" * 40
+                raise GitHubClientError
+            self.head_sha = commit_sha
+
+        async def update_repository_pull_request_body(self, _token, repository, number, body):
+            assert number == 4
+            if self.fail_body_once:
+                self.fail_body_once = False
+                raise GitHubClientError
+            self.updated_body = body
+            self.body = body
+            return await self.get_repository_pull_request(_token, repository, number)
+
+        async def create_repository_pull_request(self, *_args):
+            self.created_pull_requests += 1
+            raise AssertionError("Must revise the existing pull request")
+
+    fake = RevisionClient()
+    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_target)
+    monkeypatch.setattr("github_oauth_worker.app.resolve_official_engine_commit", resolve_engine)
+    monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
+    app = create_app(
+        _ready_settings(),
+        binding_store=InMemoryBindingStore(),
+        github_client=fake,
+    )
+    reviewed_digest = _migration_plan_digest(
+        CmsMigrationPreview(
+            base_commit_sha=base_sha,
+            target_branch="cms",
+            engine_selector="cms",
+            engine_commit_sha=new_engine,
+            changed_paths=("your_content/comic_info.toml",),
+            files=(MigrationPlanFile("your_content/comic_info.toml", "title = 'New'\n"),),
+        )
+    )
+    issued = app.state.state_manager.issue_cms_enablement_confirmation(
+        123,
+        456,
+        "cms",
+        base_sha,
+        "cms",
+        new_engine,
+        "0" * 64 if plan_changed else reviewed_digest,
+    )
+    response = TestClient(app).get(
+        f"/callback?code=one-time-code&state={issued.token}",
+        headers={"Cookie": f"{issued.cookie_name}={issued.correlation_nonce}"},
+    )
+
+    if plan_changed:
+        assert response.status_code == 409
+        assert "cms_migration_review_changed" in response.text
+        assert fake.updated_body == ""
+        return
+    if race:
+        assert response.status_code == 409
+        assert "cms_migration_retry" in response.text
+        assert "/setup?installation_id=456" in response.text
+        issued = app.state.state_manager.issue_cms_enablement_confirmation(
+            123, 456, "cms", base_sha, "cms", new_engine, reviewed_digest
+        )
+        response = TestClient(app).get(
+            f"/callback?code=one-time-code&state={issued.token}",
+            headers={"Cookie": f"{issued.cookie_name}={issued.correlation_nonce}"},
+        )
+    if interrupt_after_branch:
+        assert response.status_code == 409
+        assert "cms_migration_retry" in response.text
+        issued = app.state.state_manager.issue_cms_enablement_confirmation(
+            123, 456, "cms", base_sha, "cms", new_engine, reviewed_digest
+        )
+        response = TestClient(app).get(
+            f"/callback?code=one-time-code&state={issued.token}",
+            headers={"Cookie": f"{issued.cookie_name}={issued.correlation_nonce}"},
+        )
+    assert response.status_code == 200
+    assert fake.head_sha == new_head
+    assert new_engine in fake.updated_body
+    assert fake.created_pull_requests == 0
+    if edited_body:
+        assert "Manual note" in fake.updated_body
 
 
 def test_origin_migration_uses_the_exact_destination_handshake_before_activation() -> None:
@@ -492,12 +1081,13 @@ def test_origin_migration_uses_the_exact_destination_handshake_before_activation
 
     start = client.post(
         "/origins/migrate/handshake",
-        json={
+        data={
             "origin": "https://old-cms.example.com",
             "target_origin": "https://new-cms.example.com",
         },
         follow_redirects=False,
     )
+    assert start.status_code == 302
     state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
     cookie = start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
 
@@ -510,7 +1100,7 @@ def test_origin_migration_uses_the_exact_destination_handshake_before_activation
 
     complete = client.post(
         "/origins/complete/handshake",
-        json={"origin": "https://new-cms.example.com"},
+        data={"origin": "https://new-cms.example.com"},
     )
     assert complete.status_code == 200
     assert awaitable_result(store.get_binding_for_origin("https://new-cms.example.com")) is not None
@@ -539,7 +1129,7 @@ def test_failed_github_verification_marks_the_binding_for_recovery() -> None:
 
     start = client.post(
         "/auth/handshake",
-        json={"origin": "https://cms.example.com"},
+        data={"origin": "https://cms.example.com"},
         follow_redirects=False,
     )
     state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
@@ -625,6 +1215,9 @@ class _FakeGitHubClient:
 
     def __init__(self, fail_repository_verification: bool = False) -> None:
         self._fail_repository_verification = fail_repository_verification
+
+    async def list_open_repository_pull_requests(self, _token, _repository, _base):
+        return ()
 
     async def verify_bound_repository_access(
         self,

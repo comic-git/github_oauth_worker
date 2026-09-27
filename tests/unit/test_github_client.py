@@ -45,9 +45,7 @@ def test_exchange_requests_a_repository_restricted_token_without_logging_secrets
 
         assert token.access_token.get_secret_value() == "user-access-token"
         assert captured_request is not None
-        assert captured_request.url == httpx.URL(
-            "https://github.com/login/oauth/access_token"
-        )
+        assert captured_request.url == httpx.URL("https://github.com/login/oauth/access_token")
         assert "repository_id=123" in captured_request.content.decode()
         assert "one-time-code" in captured_request.content.decode()
 
@@ -286,6 +284,138 @@ def test_cms_enablement_writes_one_atomic_commit_and_finds_existing_pr() -> None
                 }
             ],
         }
+
+    asyncio.run(scenario())
+
+
+def test_existing_migration_pr_updates_only_with_a_non_force_ref_advance() -> None:
+    async def scenario() -> None:
+        repository = _repository()
+        requests: list[tuple[str, str, object]] = []
+        pr_ref = {
+            "ref": "cms-enable-1",
+            "sha": SHA_A,
+            "repo": {
+                "id": 123,
+                "name": "comic",
+                "owner": {"login": "owner"},
+            },
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content) if request.content else None
+            requests.append((request.method, request.url.path, payload))
+            if request.url.path == "/repos/owner/comic/git/refs/heads/cms-enable-1":
+                assert payload == {"sha": SHA_B, "force": False}
+                return httpx.Response(
+                    200,
+                    json={
+                        "ref": "refs/heads/cms-enable-1",
+                        "object": {"type": "commit", "sha": SHA_B},
+                    },
+                )
+            if request.url.path == "/repos/owner/comic/pulls/4":
+                if request.method == "PATCH":
+                    assert payload == {"body": "Updated engine SHA"}
+                return httpx.Response(
+                    200,
+                    json={
+                        "number": 4,
+                        "html_url": "https://github.com/owner/comic/pull/4",
+                        "state": "open",
+                        "head": pr_ref,
+                        "base": {**pr_ref, "ref": "master"},
+                    },
+                )
+            raise AssertionError(f"Unexpected URL: {request.url}")
+
+        client = _client(handler)
+        token = SecretStr("user-access-token")
+        details = await client.get_repository_pull_request(token, repository, 4)
+        await client.update_repository_branch(token, repository, "cms-enable-1", SHA_B)
+        await client.update_repository_pull_request_body(token, repository, 4, "Updated engine SHA")
+
+        assert details.head.repo.id == repository.id
+        assert [method for method, _, _ in requests] == ["GET", "PATCH", "PATCH"]
+
+    asyncio.run(scenario())
+
+
+def test_migration_pr_discovery_and_superseded_pr_close() -> None:
+    async def scenario() -> None:
+        repository = _repository()
+        pr_ref = {
+            "ref": "comic-git/cms-enable/123456789abc",
+            "sha": SHA_A,
+            "repo": {"id": 123, "name": "comic", "owner": {"login": "owner"}},
+        }
+        pull_request = {
+            "number": 4,
+            "html_url": "https://github.com/owner/comic/pull/4",
+            "state": "open",
+            "head": pr_ref,
+            "base": {**pr_ref, "ref": "master"},
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if (
+                request.url.path == "/repos/owner/comic/pulls"
+                and request.url.params["state"] == "open"
+            ):
+                assert request.url.params["base"] == "master"
+                return httpx.Response(200, json=[pull_request])
+            if (
+                request.url.path == "/repos/owner/comic/pulls"
+                and request.url.params["state"] == "all"
+            ):
+                assert request.url.params["head"] == "owner:comic-git/cms-enable/123456789abc"
+                return httpx.Response(200, json=[{**pull_request, "state": "closed"}])
+            if (
+                request.url.path
+                == "/repos/owner/comic/git/ref/heads/comic-git/cms-enable/123456789abc"
+            ):
+                return httpx.Response(404, json={"message": "Not Found"})
+            if request.url.path == "/repos/owner/comic/pulls/4":
+                assert json.loads(request.content) == {"state": "closed"}
+                return httpx.Response(200, json={**pull_request, "state": "closed"})
+            raise AssertionError(f"Unexpected URL: {request.url}")
+
+        client = _client(handler)
+        token = SecretStr("user-access-token")
+        open_prs = await client.list_open_repository_pull_requests(token, repository, "master")
+        attached = await client.list_repository_pull_requests_for_head(
+            token, repository, pr_ref["ref"]
+        )
+        missing_ref = await client.find_repository_ref(token, repository, f"heads/{pr_ref['ref']}")
+        closed = await client.close_repository_pull_request(token, repository, 4)
+
+        assert [pr.number for pr in open_prs] == [4]
+        assert attached[0].state == "closed"
+        assert missing_ref is None
+        assert closed.state == "closed"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status_code", [204, 404])
+def test_delete_superseded_migration_branch_is_idempotent(status_code: int) -> None:
+    async def scenario() -> None:
+        requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "DELETE"
+            requests.append(request.url.path)
+            return httpx.Response(status_code)
+
+        client = _client(handler)
+        await client.delete_repository_branch(
+            SecretStr("user-access-token"),
+            _repository(),
+            "comic-git/cms-enable/123456789abc",
+        )
+        assert requests == [
+            "/repos/owner/comic/git/refs/heads/comic-git/cms-enable/123456789abc"
+        ]
 
     asyncio.run(scenario())
 

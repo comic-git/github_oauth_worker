@@ -1,3 +1,3 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>CMS migration is ready</title></head>
-<body><main><h1>CMS migration is ready</h1><p>Review and merge the migration pull request, then deploy the site before opening the CMS.</p><p><a href="{{ pull_request_url }}">Review migration pull request</a></p></main></body></html>
+<body><main><h1>CMS migration is ready</h1><p>Review and merge the migration pull request, then deploy the site before opening the CMS.</p><p><a href="{{ pull_request_url }}">Review migration pull request</a></p>{% if unremoved_branches %}<p>The worker could not remove these older migration branches. Delete them from the repository's Branches page when convenient:</p><ul>{% for branch in unremoved_branches %}<li><code>{{ branch }}</code></li>{% endfor %}</ul>{% endif %}</main></body></html>

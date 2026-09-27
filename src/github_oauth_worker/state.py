@@ -42,6 +42,7 @@ class OAuthState(BaseModel):
     base_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     engine_selector: str | None = None
     engine_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    reviewed_plan_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_flow_context(self) -> OAuthState:
@@ -86,6 +87,7 @@ class OAuthState(BaseModel):
             or self.base_commit_sha is None
             or self.engine_selector is None
             or self.engine_commit_sha is None
+            or self.reviewed_plan_digest is None
         ):
             raise ValueError(
                 "CMS confirmation state requires the reviewed repository and plan identity."
@@ -103,11 +105,20 @@ class OAuthState(BaseModel):
             raise ValueError("Origin-migration OAuth state requires source and target contexts.")
         if self.flow in (OAuthFlow.DECAP, OAuthFlow.SETUP) and self.target_origin is not None:
             raise ValueError("Only origin-migration state may contain a target origin.")
-        if self.flow not in (
-            OAuthFlow.CMS_ENABLEMENT_BRANCH,
-            OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
-        ) and self.target_branch is not None:
+        if (
+            self.flow
+            not in (
+                OAuthFlow.CMS_ENABLEMENT_BRANCH,
+                OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+            )
+            and self.target_branch is not None
+        ):
             raise ValueError("Only branch-bound CMS states may contain a target branch.")
+        if (
+            self.flow is not OAuthFlow.CMS_ENABLEMENT_CONFIRMATION
+            and self.reviewed_plan_digest is not None
+        ):
+            raise ValueError("Only CMS confirmation state may contain a reviewed plan.")
         return self
 
 
@@ -206,6 +217,7 @@ class OAuthStateManager:
         base_commit_sha: str,
         engine_selector: str,
         engine_commit_sha: str,
+        reviewed_plan_digest: str,
     ) -> IssuedOAuthState:
         """Bind confirmation to the exact reviewed target revision and engine source revision."""
         return self._issue_without_origin(
@@ -216,6 +228,7 @@ class OAuthStateManager:
             base_commit_sha=base_commit_sha,
             engine_selector=engine_selector,
             engine_commit_sha=engine_commit_sha,
+            reviewed_plan_digest=reviewed_plan_digest,
         )
 
     def issue_cms_enablement_branch(
@@ -345,6 +358,7 @@ class OAuthStateManager:
         base_commit_sha: str | None = None,
         engine_selector: str | None = None,
         engine_commit_sha: str | None = None,
+        reviewed_plan_digest: str | None = None,
     ) -> IssuedOAuthState:
         """Sign a direct GitHub App setup flow that deliberately has no CMS browser origin."""
         correlation_nonce = secrets.token_urlsafe(32)
@@ -357,6 +371,7 @@ class OAuthStateManager:
             base_commit_sha=base_commit_sha,
             engine_selector=engine_selector,
             engine_commit_sha=engine_commit_sha,
+            reviewed_plan_digest=reviewed_plan_digest,
         )
         token = self._serializer(flow).dumps(state.model_dump(mode="json"))
         return IssuedOAuthState(

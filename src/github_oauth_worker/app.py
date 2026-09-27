@@ -1,6 +1,9 @@
 """FastAPI application composition for the GitHub OAuth worker."""
 
+import hashlib
+import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlencode
 
@@ -19,6 +22,8 @@ from github_oauth_worker.cms_enablement import (
     CmsMigrationPreview,
     TargetRepositoryState,
     build_migration_preview,
+    compare_migration_files,
+    migration_branch_name,
     read_target_repository_state,
     resolve_official_engine_commit,
 )
@@ -39,18 +44,16 @@ from github_oauth_worker.decap_protocol import (
     render_origin_migration_handshake_page,
     render_success_callback_page,
 )
-from github_oauth_worker.enablement_operations import (
-    EnablementOperation,
-    EnablementOperationStore,
-    FirestoreEnablementOperationStore,
-    migration_branch_name,
-)
 from github_oauth_worker.engine_resolution import EngineSelectorError, EngineSelectorPolicy
 from github_oauth_worker.enrollment import render_enrollment_confirmation_page
 from github_oauth_worker.errors import WorkerError
 from github_oauth_worker.github_client import (
     GitHubAccessVerificationError,
     GitHubAppClient,
+    GitHubClientError,
+    GitHubGitReference,
+    GitHubGitTree,
+    GitHubPullRequestDetails,
     GitHubRepository,
     GitHubTreeChange,
 )
@@ -73,6 +76,26 @@ class RefreshTokenRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     refresh_token: SecretStr
+
+
+class CmsMigrationReviewChangedError(WorkerError):
+    """Require a new review when the target or generated migration plan changes."""
+
+    status_code = 409
+    diagnostic_code = "cms_migration_review_changed"
+    public_message = (
+        "The target branch or migration plan changed. Review the latest result and try again."
+    )
+
+
+class CmsMigrationRetryError(WorkerError):
+    """A GitHub write raced with another change; a fresh review is enough to recover."""
+
+    status_code = 409
+    diagnostic_code = "cms_migration_retry"
+    public_message = (
+        "The repository changed while CMS setup was saving. Review the latest result and try again."
+    )
 
 
 class EnrollmentSelectionRequest(BaseModel):
@@ -128,6 +151,17 @@ class OriginMigrationHandshakeRequest(BaseModel):
     target_origin: str
 
 
+async def _validated_form[FormModel: BaseModel](
+    request: Request, model: type[FormModel]
+) -> FormModel:
+    """Validate a browser form without adding a multipart parser dependency."""
+    try:
+        fields = parse_qs((await request.body()).decode("utf-8"))
+        return model.model_validate({name: values[0] for name, values in fields.items() if values})
+    except UnicodeDecodeError, ValidationError:
+        raise WorkerError from None
+
+
 _CMS_ENABLEMENT_FLOWS = frozenset(
     {
         OAuthFlow.CMS_ENABLEMENT_INSTALLATION,
@@ -141,7 +175,6 @@ _CMS_ENABLEMENT_FLOWS = frozenset(
 def create_app(
     settings: WorkerSettings | None = None,
     binding_store: BindingStore | None = None,
-    operation_store: EnablementOperationStore | None = None,
     github_client: GitHubAppClient | None = None,
 ) -> FastAPI:
     """Create the worker and compose ready-mode dependencies only after settings validation."""
@@ -186,9 +219,6 @@ def create_app(
 
         app.state.binding_store = binding_store or FirestoreBindingStore.from_settings(
             worker_settings
-        )
-        app.state.operation_store = operation_store or (
-            FirestoreEnablementOperationStore.from_settings(worker_settings)
         )
         app.state.github_client = github_client or GitHubAppClient.from_settings(worker_settings)
         app.state.state_manager = OAuthStateManager.from_settings(worker_settings)
@@ -276,6 +306,7 @@ def create_app(
             assert oauth_state.base_commit_sha is not None
             assert oauth_state.engine_selector is not None
             assert oauth_state.engine_commit_sha is not None
+            assert oauth_state.reviewed_plan_digest is not None
             issued_state = app.state.state_manager.issue_cms_enablement_confirmation(
                 oauth_state.repository_id,
                 oauth_state.installation_id,
@@ -283,6 +314,7 @@ def create_app(
                 oauth_state.base_commit_sha,
                 oauth_state.engine_selector,
                 oauth_state.engine_commit_sha,
+                oauth_state.reviewed_plan_digest,
             )
             return redirect_to_github(issued_state, oauth_state.repository_id)
 
@@ -311,8 +343,9 @@ def create_app(
             return redirect_to_github(issued_state, oauth_state.repository_id)
 
         @app.post("/setup/handshake")
-        def setup_handshake(handshake: SetupHandshakeRequest) -> RedirectResponse:
+        async def setup_handshake(request: Request) -> RedirectResponse:
             """Require fresh GitHub user authorization before trusting a setup installation ID."""
+            handshake = await _validated_form(request, SetupHandshakeRequest)
             issued_state = app.state.state_manager.issue_setup_installation(
                 handshake.origin,
                 handshake.installation_id,
@@ -329,9 +362,10 @@ def create_app(
 
         @app.post("/origins/migrate/handshake")
         async def origin_migration_handshake(
-            handshake: OriginMigrationHandshakeRequest,
+            request: Request,
         ) -> RedirectResponse:
             """Authorize a migration only after the source origin resolves to an active binding."""
+            handshake = await _validated_form(request, OriginMigrationHandshakeRequest)
             binding = await app.state.binding_store.get_binding_for_origin(handshake.origin)
             if binding is None or binding.status is not BindingStatus.ACTIVE:
                 raise WorkerError
@@ -355,9 +389,10 @@ def create_app(
 
         @app.post("/origins/complete/handshake")
         async def complete_origin_migration_handshake(
-            handshake: AuthHandshakeRequest,
+            request: Request,
         ) -> HTMLResponse:
             """Activate only a non-expired pending origin whose exact opener origin matches it."""
+            handshake = await _validated_form(request, AuthHandshakeRequest)
             await app.state.binding_store.complete_origin_migration(
                 handshake.origin,
                 timedelta(seconds=worker_settings.origin_grace_period_seconds),
@@ -365,8 +400,9 @@ def create_app(
             return HTMLResponse(render_management_result_page("CMS origin migration is complete."))
 
         @app.post("/auth/handshake")
-        async def auth_handshake(handshake: AuthHandshakeRequest) -> RedirectResponse:
+        async def auth_handshake(request: Request) -> RedirectResponse:
             """Resolve a bound opener origin, then redirect its binding to GitHub authorization."""
+            handshake = await _validated_form(request, AuthHandshakeRequest)
             binding = await app.state.binding_store.get_binding_for_origin(handshake.origin)
             if binding is None:
                 issued_state = app.state.state_manager.issue_enrollment(handshake.origin)
@@ -484,6 +520,14 @@ def create_app(
                             error.public_message,
                             heading="comic_git CMS setup could not continue",
                             diagnostic_code=error.diagnostic_code,
+                            retry_url=(
+                                f"/setup?installation_id={oauth_state.installation_id}"
+                                if isinstance(
+                                    error, (CmsMigrationRetryError, CmsMigrationReviewChangedError)
+                                )
+                                and oauth_state.installation_id is not None
+                                else None
+                            ),
                         ),
                         status_code=error.status_code,
                     )
@@ -737,6 +781,59 @@ def create_app(
             )
             return target_state, preview
 
+        async def open_migration_pull_requests(
+            repository: GitHubRepository, access_token: SecretStr, target_branch: str
+        ) -> tuple[GitHubPullRequestDetails, ...]:
+            """Treat GitHub PRs in the worker's reserved branch namespace as current state."""
+            candidates = await app.state.github_client.list_open_repository_pull_requests(
+                access_token, repository, target_branch
+            )
+            return tuple(
+                pr
+                for pr in candidates
+                if pr.state == "open"
+                and pr.head.repo is not None
+                and pr.head.repo.id == repository.id
+                and pr.base.repo is not None
+                and pr.base.repo.id == repository.id
+                and pr.base.ref == target_branch
+                and re.fullmatch(r"comic-git/cms-enable/[0-9a-f]{12}(?:-[1-9][0-9]*)?", pr.head.ref)
+            )
+
+        async def migration_branch_tree(
+            repository: GitHubRepository, access_token: SecretStr, branch_name: str
+        ) -> tuple[GitHubGitReference, GitHubGitTree]:
+            branch = await app.state.github_client.get_repository_ref(
+                access_token, repository, f"heads/{branch_name}"
+            )
+            commit = await app.state.github_client.get_repository_commit(
+                access_token, repository, branch.object.sha
+            )
+            tree = await app.state.github_client.get_repository_tree(
+                access_token, repository, commit.tree.sha
+            )
+            if tree.truncated:
+                raise CmsMigrationRetryError
+            return branch, tree
+
+        async def available_migration_branch_name(
+            repository: GitHubRepository, access_token: SecretStr, base_name: str
+        ) -> tuple[str, GitHubGitReference | None]:
+            """Reuse an orphan branch, but never revive a branch attached to a closed PR."""
+            for suffix in range(0, 20):
+                name = base_name if suffix == 0 else f"{base_name}-{suffix}"
+                existing = await app.state.github_client.find_repository_ref(
+                    access_token, repository, f"heads/{name}"
+                )
+                if existing is None:
+                    return name, None
+                attached = await app.state.github_client.list_repository_pull_requests_for_head(
+                    access_token, repository, name
+                )
+                if not attached:
+                    return name, existing
+            raise CmsMigrationRetryError
+
         async def cms_enablement_repository_callback(
             oauth_state: OAuthState,
             code: str,
@@ -821,8 +918,37 @@ def create_app(
             await app.state.github_client.require_repository_administrator(
                 access_token.access_token, repository, github_user.login
             )
-            _, preview = await build_logged_cms_migration_preview(
+            target_state, preview = await build_logged_cms_migration_preview(
                 repository, access_token.access_token, oauth_state.target_branch
+            )
+            branch_name = migration_branch_name(preview.target_branch, preview.base_commit_sha)
+            pull_requests = await open_migration_pull_requests(
+                repository, access_token.access_token, preview.target_branch
+            )
+            current = max(
+                (pr for pr in pull_requests if _matches_migration_branch(pr.head.ref, branch_name)),
+                key=lambda pr: pr.number,
+                default=None,
+            )
+            superseded = tuple(pr for pr in pull_requests if pr != current)
+            comparison_tree = target_state.tree
+            if current is not None:
+                _, comparison_tree = await migration_branch_tree(
+                    repository, access_token.access_token, current.head.ref
+                )
+            changes = await compare_migration_files(
+                app.state.github_client,
+                access_token.access_token,
+                repository,
+                target_state.tree,
+                comparison_tree,
+                preview,
+            )
+            up_to_date = (
+                current is not None
+                and not changes
+                and _migration_body_has_engine_sha(current.body, preview.engine_commit_sha)
+                and not superseded
             )
             confirmation = app.state.state_manager.issue_cms_enablement_confirmation(
                 repository.id,
@@ -831,9 +957,18 @@ def create_app(
                 preview.base_commit_sha,
                 preview.engine_selector,
                 preview.engine_commit_sha,
+                _migration_plan_digest(preview),
             )
             response = HTMLResponse(
-                render_cms_migration_summary_page(confirmation.token, repository, preview)
+                render_cms_migration_summary_page(
+                    confirmation.token,
+                    repository,
+                    preview,
+                    changes,
+                    current.html_url if current else None,
+                    up_to_date,
+                    superseded,
+                )
             )
             app.state.state_manager.attach_correlation_cookie(response, confirmation)
             return response
@@ -873,126 +1008,165 @@ def create_app(
                 or preview.engine_selector != oauth_state.engine_selector
                 or preview.engine_commit_sha != oauth_state.engine_commit_sha
             ):
-                raise WorkerError
+                raise CmsMigrationReviewChangedError
             branch_name = migration_branch_name(preview.target_branch, preview.base_commit_sha)
-            operation = await app.state.operation_store.put_planned(
-                EnablementOperation.create(
-                    repository_id=repository.id,
-                    target_branch=preview.target_branch,
-                    base_commit_sha=preview.base_commit_sha,
-                    engine_selector=preview.engine_selector,
-                    engine_commit_sha=preview.engine_commit_sha,
-                    branch_name=branch_name,
-                )
+            if _migration_plan_digest(preview) != oauth_state.reviewed_plan_digest:
+                raise CmsMigrationReviewChangedError
+            pull_requests = await open_migration_pull_requests(
+                repository, access_token.access_token, preview.target_branch
             )
-            if operation.pull_request_url is not None:
-                log_event(
-                    logger,
-                    "cms_setup_existing_pull_request_returned",
-                    repository_id=repository.id,
-                    repository_owner=repository.owner.login,
-                    repository_name=repository.name,
-                    base_commit_sha=preview.base_commit_sha,
-                    pull_request_url=operation.pull_request_url,
-                )
-                return HTMLResponse(render_cms_migration_result_page(operation.pull_request_url))
-            claim = await app.state.operation_store.claim_writing(
-                repository.id, preview.target_branch, preview.base_commit_sha
+            current = max(
+                (pr for pr in pull_requests if _matches_migration_branch(pr.head.ref, branch_name)),
+                key=lambda pr: pr.number,
+                default=None,
             )
-            if not claim.acquired:
-                existing_pr = await app.state.github_client.find_open_repository_pull_request(
-                    access_token.access_token, repository, claim.operation.branch_name
+            if current is not None:
+                branch, current_tree = await migration_branch_tree(
+                    repository, access_token.access_token, current.head.ref
                 )
-                if existing_pr is None:
-                    raise WorkerError
-                operation = await app.state.operation_store.complete(
-                    repository.id,
-                    preview.target_branch,
-                    preview.base_commit_sha,
-                    existing_pr.number,
-                    existing_pr.html_url,
+                file_changes = await compare_migration_files(
+                    app.state.github_client,
+                    access_token.access_token,
+                    repository,
+                    target_state.tree,
+                    current_tree,
+                    preview,
                 )
-                log_event(
-                    logger,
-                    "cms_setup_existing_pull_request_recovered",
-                    repository_id=repository.id,
-                    repository_owner=repository.owner.login,
-                    repository_name=repository.name,
-                    base_commit_sha=preview.base_commit_sha,
-                    pull_request_url=operation.pull_request_url,
+                if file_changes:
+                    blobs = await app.state.github_client.create_repository_blobs(
+                        access_token.access_token,
+                        repository,
+                        tuple(GitHubTreeChange(file.path, file.content) for file in preview.files),
+                    )
+                    tree = await app.state.github_client.create_repository_tree(
+                        access_token.access_token, repository, target_state.tree.sha, blobs
+                    )
+                    commit = await app.state.github_client.create_repository_commit(
+                        access_token.access_token,
+                        repository,
+                        "Refresh comic_git CMS migration",
+                        tree.sha,
+                        branch.object.sha,
+                    )
+                    try:
+                        await app.state.github_client.update_repository_branch(
+                            access_token.access_token, repository, current.head.ref, commit.sha
+                        )
+                    except GitHubClientError:
+                        raise CmsMigrationRetryError from None
+                refreshed_body = _refreshed_migration_body(current.body, preview)
+                if refreshed_body != current.body:
+                    try:
+                        await app.state.github_client.update_repository_pull_request_body(
+                            access_token.access_token, repository, current.number, refreshed_body
+                        )
+                    except GitHubClientError:
+                        raise CmsMigrationRetryError from None
+                pull_request = current
+            else:
+                branch_name, orphan = await available_migration_branch_name(
+                    repository, access_token.access_token, branch_name
                 )
-                return HTMLResponse(
-                    render_cms_migration_result_page(operation.pull_request_url or "")
+                blobs = await app.state.github_client.create_repository_blobs(
+                    access_token.access_token,
+                    repository,
+                    tuple(GitHubTreeChange(file.path, file.content) for file in preview.files),
                 )
+                tree = await app.state.github_client.create_repository_tree(
+                    access_token.access_token, repository, target_state.tree.sha, blobs
+                )
+                if orphan is None:
+                    commit = await app.state.github_client.create_repository_commit(
+                        access_token.access_token,
+                        repository,
+                        "Enable comic_git CMS",
+                        tree.sha,
+                        target_state.base_commit_sha,
+                    )
+                    try:
+                        await app.state.github_client.create_repository_branch(
+                            access_token.access_token, repository, branch_name, commit.sha
+                        )
+                    except GitHubClientError:
+                        raise CmsMigrationRetryError from None
+                else:
+                    _, orphan_tree = await migration_branch_tree(
+                        repository, access_token.access_token, branch_name
+                    )
+                    if orphan_tree.sha != tree.sha:
+                        commit = await app.state.github_client.create_repository_commit(
+                            access_token.access_token,
+                            repository,
+                            "Refresh comic_git CMS migration",
+                            tree.sha,
+                            orphan.object.sha,
+                        )
+                        try:
+                            await app.state.github_client.update_repository_branch(
+                                access_token.access_token, repository, branch_name, commit.sha
+                            )
+                        except GitHubClientError:
+                            raise CmsMigrationRetryError from None
+                try:
+                    pull_request = await app.state.github_client.create_repository_pull_request(
+                        access_token.access_token,
+                        repository,
+                        "Enable comic_git CMS",
+                        _migration_pull_request_body(preview),
+                        branch_name,
+                        preview.target_branch,
+                    )
+                except GitHubClientError:
+                    raise CmsMigrationRetryError from None
+            unremoved_branches: set[str] = set()
+            deleted_branches: set[str] = set()
+            github_client = app.state.github_client
+            for old_pr in pull_requests:
+                if old_pr.number != pull_request.number:
+                    try:
+                        await github_client.close_repository_pull_request(
+                            access_token.access_token, repository, old_pr.number
+                        )
+                    except GitHubClientError:
+                        raise CmsMigrationRetryError from None
+                    old_branch = old_pr.head.ref
+                    if old_branch == branch_name or old_branch in deleted_branches:
+                        continue
+                    try:
+                        attached = await github_client.list_repository_pull_requests_for_head(
+                            access_token.access_token, repository, old_branch
+                        )
+                        if any(pr.state == "open" for pr in attached):
+                            continue
+                        await github_client.delete_repository_branch(
+                            access_token.access_token, repository, old_branch
+                        )
+                        deleted_branches.add(old_branch)
+                        unremoved_branches.discard(old_branch)
+                    except GitHubClientError:
+                        unremoved_branches.add(old_branch)
+                        log_event(
+                            logger,
+                            "cms_setup_superseded_branch_cleanup_failed",
+                            severity=logging.WARNING,
+                            repository_id=repository.id,
+                            branch=old_branch,
+                        )
             log_event(
                 logger,
-                "cms_setup_migration_write_started",
+                "cms_setup_pull_request_ready",
                 repository_id=repository.id,
                 repository_owner=repository.owner.login,
                 repository_name=repository.name,
-                base_commit_sha=preview.base_commit_sha,
-                branch_name=branch_name,
                 target_branch=preview.target_branch,
-                planned_file_count=len(preview.files),
-            )
-            changes = tuple(GitHubTreeChange(file.path, file.content) for file in preview.files)
-            blobs = await app.state.github_client.create_repository_blobs(
-                access_token.access_token, repository, changes
-            )
-            tree = await app.state.github_client.create_repository_tree(
-                access_token.access_token, repository, target_state.tree.sha, blobs
-            )
-            commit = await app.state.github_client.create_repository_commit(
-                access_token.access_token,
-                repository,
-                "Enable comic_git CMS",
-                tree.sha,
-                target_state.base_commit_sha,
-            )
-            log_event(
-                logger,
-                "cms_setup_migration_commit_created",
-                repository_id=repository.id,
-                repository_owner=repository.owner.login,
-                repository_name=repository.name,
                 base_commit_sha=preview.base_commit_sha,
-                commit_sha=commit.sha,
-                branch_name=branch_name,
-            )
-            await app.state.github_client.create_repository_branch(
-                access_token.access_token, repository, branch_name, commit.sha
-            )
-            pull_request = await app.state.github_client.create_repository_pull_request(
-                access_token.access_token,
-                repository,
-                "Enable comic_git CMS",
-                (
-                    f"Engine selector: `{preview.engine_selector}`\n\n"
-                    f"Resolved engine SHA: `{preview.engine_commit_sha}`\n\n"
-                    f"Target branch: `{preview.target_branch}`"
-                ),
-                branch_name,
-                preview.target_branch,
-            )
-            operation = await app.state.operation_store.complete(
-                repository.id,
-                preview.target_branch,
-                preview.base_commit_sha,
-                pull_request.number,
-                pull_request.html_url,
-            )
-            log_event(
-                logger,
-                "cms_setup_pull_request_created",
-                repository_id=repository.id,
-                repository_owner=repository.owner.login,
-                repository_name=repository.name,
-                base_commit_sha=preview.base_commit_sha,
-                target_branch=preview.target_branch,
-                pull_request_number=pull_request.number,
                 pull_request_url=pull_request.html_url,
             )
-            return HTMLResponse(render_cms_migration_result_page(operation.pull_request_url or ""))
+            return HTMLResponse(
+                render_cms_migration_result_page(
+                    pull_request.html_url, tuple(sorted(unremoved_branches))
+                )
+            )
 
         async def origin_migration_callback(
             oauth_state: OAuthState,
@@ -1198,6 +1372,54 @@ def _cors_headers(origin: str) -> dict[str, str]:
         "Access-Control-Allow-Headers": "Content-Type",
         "Vary": "Origin",
     }
+
+
+def _migration_plan_digest(preview: CmsMigrationPreview) -> str:
+    """Identify generated content, not just the engine ref that produced it."""
+    serialized = json.dumps(
+        [(file.path, file.content) for file in preview.files],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _matches_migration_branch(branch_name: str, base_name: str) -> bool:
+    """Match one target revision, including replacement attempts after a closed PR."""
+    return branch_name == base_name or bool(
+        re.fullmatch(re.escape(base_name) + r"-[1-9][0-9]*", branch_name)
+    )
+
+
+def _migration_body_has_engine_sha(body: str | None, engine_sha: str) -> bool:
+    return body is not None and f"Resolved engine SHA: `{engine_sha}`" in body.splitlines()
+
+
+def _refreshed_migration_body(body: str | None, preview: CmsMigrationPreview) -> str:
+    """Refresh only the worker-owned audit line, preserving creator edits around it."""
+    if body is None:
+        return _migration_pull_request_body(preview)
+    line = f"Resolved engine SHA: `{preview.engine_commit_sha}`"
+    updated, count = re.subn(r"(?m)^Resolved engine SHA: `[0-9a-f]{40}`$", line, body, count=1)
+    if count:
+        return updated
+    return body.rstrip() + "\n\n" + line
+
+
+def _migration_pull_request_body(preview: CmsMigrationPreview) -> str:
+    return _migration_pull_request_body_for(
+        preview.engine_selector, preview.engine_commit_sha, preview.target_branch
+    )
+
+
+def _migration_pull_request_body_for(
+    engine_selector: str, engine_commit_sha: str, target_branch: str
+) -> str:
+    return (
+        f"Engine selector: `{engine_selector}`\n\n"
+        f"Resolved engine SHA: `{engine_commit_sha}`\n\n"
+        f"Target branch: `{target_branch}`"
+    )
 
 
 def _cms_enablement_input(

@@ -2,6 +2,7 @@
 
 import base64
 import configparser
+import hashlib
 import io
 import json
 import os
@@ -12,6 +13,7 @@ import tempfile
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 
 from pydantic import SecretStr
@@ -43,6 +45,12 @@ IMAGE_SUFFIXES = frozenset(
 )
 SUPPORTED_RUNNER_RUNTIME_PACKAGES = frozenset({"tomli-w"})
 RUNNER_FAILURE_CODES = frozenset({"request_invalid", "internal_error"})
+
+
+def migration_branch_name(target_branch: str, base_commit_sha: str) -> str:
+    """Reserve one migration branch name for a selected target revision."""
+    identity = f"{target_branch}\0{base_commit_sha}".encode()
+    return f"comic-git/cms-enable/{hashlib.sha256(identity).hexdigest()[:12]}"
 
 
 class CmsEnablementError(WorkerError):
@@ -82,10 +90,10 @@ class CmsEnablementError(WorkerError):
     public_message = "This repository cannot be prepared for CMS enablement by this worker."
 
     def __init__(
-            self,
-            diagnostic_code: str = "cms_enablement_failed",
-            *,
-            safe_log_fields: Mapping[str, object] | None = None,
+        self,
+        diagnostic_code: str = "cms_enablement_failed",
+        *,
+        safe_log_fields: Mapping[str, object] | None = None,
     ) -> None:
         """Map an internal boundary category to a safe troubleshooting response."""
         self.diagnostic_code = diagnostic_code
@@ -149,6 +157,77 @@ class CmsMigrationPreview:
     engine_commit_sha: str
     changed_paths: tuple[str, ...]
     files: tuple[MigrationPlanFile, ...]
+
+
+class MigrationFileChangeKind(StrEnum):
+    """How a proposed migration changes the current branch contents."""
+
+    ADDED = "added"
+    UPDATED = "updated"
+    REMOVED = "removed"
+
+
+@dataclass(frozen=True)
+class MigrationFileChange:
+    """One path whose contents will differ after a migration PR is created or revised."""
+
+    path: str
+    kind: MigrationFileChangeKind
+
+
+async def compare_migration_files(
+    client: GitHubAppClient,
+    user_access_token: SecretStr,
+    repository: GitHubRepository,
+    base_tree: GitHubGitTree,
+    current_tree: GitHubGitTree,
+    preview: CmsMigrationPreview,
+) -> tuple[MigrationFileChange, ...]:
+    """Compare the proposed base-plus-plan tree to the current PR branch without Git writes."""
+    if base_tree.truncated or current_tree.truncated:
+        raise CmsEnablementError("repository_revision_invalid")
+    base = {entry.path: entry for entry in base_tree.tree if entry.type != "tree"}
+    current = {entry.path: entry for entry in current_tree.tree if entry.type != "tree"}
+    planned = {file.path: file.content for file in preview.files}
+    changes = []
+    for path in sorted(base.keys() | current.keys() | planned.keys()):
+        old_entry = current.get(path)
+        if path in planned:
+            if old_entry is None:
+                changes.append(MigrationFileChange(path, MigrationFileChangeKind.ADDED))
+                continue
+            if (
+                old_entry.type != "blob"
+                or old_entry.mode != "100644"
+                or old_entry.size is None
+                or old_entry.size > MAXIMUM_SNAPSHOT_TEXT_FILE_BYTES
+            ):
+                changes.append(MigrationFileChange(path, MigrationFileChangeKind.UPDATED))
+                continue
+            blob = await client.get_repository_blob(user_access_token, repository, old_entry.sha)
+            try:
+                same_content = decode_text_blob(blob) == planned[path]
+            except CmsEnablementError:
+                same_content = False
+            if not same_content:
+                changes.append(MigrationFileChange(path, MigrationFileChangeKind.UPDATED))
+            continue
+        base_entry = base.get(path)
+        if base_entry is None and old_entry is not None:
+            changes.append(MigrationFileChange(path, MigrationFileChangeKind.REMOVED))
+        elif old_entry is None and base_entry is not None:
+            changes.append(MigrationFileChange(path, MigrationFileChangeKind.ADDED))
+        elif (
+            old_entry is not None
+            and base_entry is not None
+            and (
+                old_entry.sha != base_entry.sha
+                or old_entry.mode != base_entry.mode
+                or old_entry.type != base_entry.type
+            )
+        ):
+            changes.append(MigrationFileChange(path, MigrationFileChangeKind.UPDATED))
+    return tuple(changes)
 
 
 def extract_official_engine_archive(archive: bytes, destination: Path) -> MaterializedEngine:
@@ -351,9 +430,9 @@ def run_engine_migration(
 
 
 def runner_failure_log_fields(
-        result: subprocess.CompletedProcess[str],
-        failure_kind: str,
-        stdout_bytes: int,
+    result: subprocess.CompletedProcess[str],
+    failure_kind: str,
+    stdout_bytes: int,
 ) -> dict[str, object]:
     """Return bounded runner diagnostics without retaining target-derived stderr text."""
     return {

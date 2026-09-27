@@ -65,6 +65,7 @@ def render_management_result_page(
     *,
     heading: str = "comic_git CMS setup",
     diagnostic_code: str | None = None,
+    retry_url: str | None = None,
 ) -> str:
     """Render a safe setup result with optional operator-facing troubleshooting classification."""
     return render_template(
@@ -72,6 +73,7 @@ def render_management_result_page(
         message=message,
         heading=heading,
         diagnostic_code=diagnostic_code,
+        retry_url=retry_url,
     )
 
 

@@ -1,7 +1,11 @@
 """Creator-facing pages for direct GitHub App CMS enablement setup."""
 
-from github_oauth_worker.cms_enablement import CmsMigrationPreview
-from github_oauth_worker.github_client import GitHubRepository, GitHubRepositoryBranch
+from github_oauth_worker.cms_enablement import CmsMigrationPreview, MigrationFileChange
+from github_oauth_worker.github_client import (
+    GitHubPullRequestDetails,
+    GitHubRepository,
+    GitHubRepositoryBranch,
+)
 from github_oauth_worker.html_templates import render_template
 
 
@@ -42,6 +46,10 @@ def render_cms_migration_summary_page(
     state_token: str,
     repository: GitHubRepository,
     preview: CmsMigrationPreview,
+    changes: tuple[MigrationFileChange, ...],
+    existing_pull_request_url: str | None = None,
+    up_to_date: bool = False,
+    superseded_pull_requests: tuple[GitHubPullRequestDetails, ...] = (),
 ) -> str:
     """Render a content-free engine migration summary before the creator can request a write."""
     return render_template(
@@ -49,9 +57,19 @@ def render_cms_migration_summary_page(
         state_token=state_token,
         repository=repository,
         preview=preview,
+        changes=changes,
+        existing_pull_request_url=existing_pull_request_url,
+        up_to_date=up_to_date,
+        superseded_pull_requests=superseded_pull_requests,
     )
 
 
-def render_cms_migration_result_page(pull_request_url: str) -> str:
+def render_cms_migration_result_page(
+    pull_request_url: str, unremoved_branches: tuple[str, ...] = ()
+) -> str:
     """Render the final non-secret link to the creator's migration pull request."""
-    return render_template("cms_setup_result.tpl", pull_request_url=pull_request_url)
+    return render_template(
+        "cms_setup_result.tpl",
+        pull_request_url=pull_request_url,
+        unremoved_branches=unremoved_branches,
+    )

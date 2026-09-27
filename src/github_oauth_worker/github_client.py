@@ -160,6 +160,8 @@ class GitHubGitCommit(BaseModel):
 
     sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     tree: GitHubGitSha
+    message: str | None = None
+    parents: tuple[GitHubGitSha, ...] | None = None
 
 
 class GitHubPullRequest(BaseModel):
@@ -170,6 +172,25 @@ class GitHubPullRequest(BaseModel):
     number: int = Field(gt=0)
     html_url: str = Field(min_length=1)
     state: str = Field(min_length=1)
+
+
+class GitHubPullRequestRef(BaseModel):
+    """A pull request's branch and owning repository, as returned by GitHub."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    ref: str = Field(min_length=1)
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    repo: GitHubRepository | None
+
+
+class GitHubPullRequestDetails(GitHubPullRequest):
+    """Full identity needed before revising an existing migration pull request."""
+
+    head: GitHubPullRequestRef
+    base: GitHubPullRequestRef
+    body: str | None = None
+    title: str = ""
 
 
 @dataclass(frozen=True)
@@ -385,6 +406,31 @@ class GitHubAppClient:
         )
         return self._validate_response(GitHubGitReference, response_data)
 
+    async def find_repository_ref(
+        self,
+        user_access_token: SecretStr,
+        repository: GitHubRepository,
+        ref: str,
+    ) -> GitHubGitReference | None:
+        """Distinguish an absent migration branch from other GitHub failures."""
+        response = await self._request(
+            "GET",
+            self._repository_url(
+                repository.owner.login, repository.name, f"/git/ref/{quote(ref, safe='/')}"
+            ),
+            headers=self._api_headers(user_access_token),
+            allow_not_found=True,
+        )
+        if response.status_code == 404:
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            raise GitHubClientError from None
+        if not isinstance(data, dict):
+            raise GitHubClientError
+        return self._validate_response(GitHubGitReference, data)
+
     async def get_repository_commit(
         self,
         user_access_token: SecretStr,
@@ -554,6 +600,106 @@ class GitHubAppClient:
         )
         return self._validate_response(GitHubGitReference, response_data)
 
+    async def update_repository_branch(
+        self,
+        user_access_token: SecretStr,
+        repository: GitHubRepository,
+        branch: str,
+        commit_sha: str,
+    ) -> GitHubGitReference:
+        """Advance a worker branch only when GitHub accepts a fast-forward update."""
+        response_data = await self._repository_api_json(
+            "PATCH",
+            repository,
+            f"/git/refs/heads/{quote(branch, safe='/')}",
+            user_access_token,
+            json_data={"sha": commit_sha, "force": False},
+        )
+        return self._validate_response(GitHubGitReference, response_data)
+
+    async def delete_repository_branch(
+        self, user_access_token: SecretStr, repository: GitHubRepository, branch: str
+    ) -> None:
+        """Remove a superseded migration branch after its pull request is closed."""
+        response = await self._request(
+            "DELETE",
+            self._repository_url(
+                repository.owner.login,
+                repository.name,
+                f"/git/refs/heads/{quote(branch, safe='/')}",
+            ),
+            headers=self._api_headers(user_access_token),
+            allow_not_found=True,
+        )
+        if response.status_code not in {204, 404}:
+            raise GitHubClientError
+
+    async def get_repository_pull_request(
+        self, user_access_token: SecretStr, repository: GitHubRepository, number: int
+    ) -> GitHubPullRequestDetails:
+        """Read exact head/base identity before updating a completed migration PR."""
+        response_data = await self._repository_api_json(
+            "GET", repository, f"/pulls/{number}", user_access_token
+        )
+        return self._validate_response(GitHubPullRequestDetails, response_data)
+
+    async def update_repository_pull_request_body(
+        self, user_access_token: SecretStr, repository: GitHubRepository, number: int, body: str
+    ) -> GitHubPullRequestDetails:
+        """Refresh the engine audit SHA only after the PR branch points at the new commit."""
+        response_data = await self._repository_api_json(
+            "PATCH",
+            repository,
+            f"/pulls/{number}",
+            user_access_token,
+            json_data={"body": body},
+        )
+        return self._validate_response(GitHubPullRequestDetails, response_data)
+
+    async def close_repository_pull_request(
+        self, user_access_token: SecretStr, repository: GitHubRepository, number: int
+    ) -> GitHubPullRequestDetails:
+        """Close a superseded migration PR after its replacement exists."""
+        response_data = await self._repository_api_json(
+            "PATCH",
+            repository,
+            f"/pulls/{number}",
+            user_access_token,
+            json_data={"state": "closed"},
+        )
+        return self._validate_response(GitHubPullRequestDetails, response_data)
+
+    async def list_open_repository_pull_requests(
+        self, user_access_token: SecretStr, repository: GitHubRepository, base: str
+    ) -> tuple[GitHubPullRequestDetails, ...]:
+        """List open PRs against one target branch, with a bound on pagination."""
+        results = []
+        for page in range(1, self._MAXIMUM_BRANCH_PAGES + 1):
+            data = await self._repository_api_json_list(
+                repository,
+                "/pulls",
+                user_access_token,
+                params={"state": "open", "base": base, "per_page": 100, "page": page},
+            )
+            results.extend(self._validate_response(GitHubPullRequestDetails, item) for item in data)
+            if len(data) < 100:
+                return tuple(results)
+        raise GitHubClientError
+
+    async def list_repository_pull_requests_for_head(
+        self, user_access_token: SecretStr, repository: GitHubRepository, branch: str
+    ) -> tuple[GitHubPullRequestDetails, ...]:
+        """Find PRs attached to a branch before reusing or deleting it."""
+        data = await self._repository_api_json_list(
+            repository,
+            "/pulls",
+            user_access_token,
+            params={"state": "all", "head": f"{repository.owner.login}:{branch}", "per_page": 100},
+        )
+        if len(data) == 100:
+            raise GitHubClientError
+        return tuple(self._validate_response(GitHubPullRequestDetails, item) for item in data)
+
     async def create_repository_pull_request(
         self,
         user_access_token: SecretStr,
@@ -654,8 +800,7 @@ class GitHubAppClient:
 
     def _repository_url(self, owner: str, repository: str, path: str) -> str:
         return (
-            f"{self._API_BASE_URL}/repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
-            f"{path}"
+            f"{self._API_BASE_URL}/repos/{quote(owner, safe='')}/{quote(repository, safe='')}{path}"
         )
 
     def _api_headers(self, user_access_token: SecretStr | None = None) -> dict[str, str]:
@@ -702,6 +847,7 @@ class GitHubAppClient:
         headers: dict[str, str],
         params: dict[str, str | int] | None = None,
         json_data: dict[str, Any] | None = None,
+        allow_not_found: bool = False,
     ) -> httpx.Response:
         """Apply one bounded request deadline and hide upstream response bodies on failure."""
         try:
@@ -715,10 +861,10 @@ class GitHubAppClient:
                     json=json_data,
                     follow_redirects=False,
                 )
-            if response.is_error:
+            if response.is_error and not (allow_not_found and response.status_code == 404):
                 response.raise_for_status()
             return response
-        except (httpx.HTTPError, TimeoutError):
+        except httpx.HTTPError, TimeoutError:
             raise GitHubClientError from None
 
     async def _request_json_list(
