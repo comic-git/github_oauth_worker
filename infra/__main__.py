@@ -60,7 +60,13 @@ image = docker.Image(
     image_name=(
         f"{artifact_registry_host}/{project_id}/github-oauth-worker-{environment}/worker:current"
     ),
-    build=docker.DockerBuildArgs(context="..", dockerfile=r"..\Dockerfile", platform="linux/amd64"),
+    build=docker.DockerBuildArgs(
+        context="..",
+        dockerfile="../Dockerfile",
+        platform="linux/amd64",
+        # This provider's BuildKit path emits invalid tar headers on Windows; BuilderV1 succeeds.
+        builder_version=docker.BuilderVersion.BUILDER_V1,
+    ),
     build_on_preview=False,
     registry=docker.RegistryArgs(
         server=artifact_registry_host,

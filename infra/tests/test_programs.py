@@ -69,7 +69,8 @@ class PulumiProgramTests(unittest.TestCase):
             "us-west1-docker.pkg.dev/comic-git/github-oauth-worker-test/worker:current",
         )
         self.assertEqual(image_inputs["build"]["context"], "..")
-        self.assertEqual(image_inputs["build"]["dockerfile"], r"..\Dockerfile")
+        self.assertEqual(image_inputs["build"]["dockerfile"], "../Dockerfile")
+        self.assertEqual(image_inputs["build"]["builderVersion"], "BuilderV1")
         self.assertFalse(image_inputs["buildOnPreview"])
         self.assertIn("gcp:cloudrunv2/service:Service", mocks.resource_types)
         self.assertIn("gcp:cloudrunv2/serviceIamMember:ServiceIamMember", mocks.resource_types)
