@@ -46,11 +46,7 @@ target can activate it. The source origin remains active until its configured gr
 The worker removes an expired source-origin index lazily when it is next looked up; it is already
 ineligible to authorize immediately at the grace-period boundary.
 
-When GitHub no longer verifies the selected installation or repository, the worker marks the
-binding `recovery_required` and refuses new tokens. A new self-service enrollment or App setup
-flow may restore the same immutable repository-ID binding after fresh installation and repository
-verification. This supports repository transfers, App repository-selection changes, and recovery
-when the old CMS origin is no longer available.
+An editor's failed repository-access check denies that editor's token but does not disable the shared binding: the failure may reflect that user's permissions, not a removed App installation. An already-enabled `/setup` run by a verified repository administrator may restore a binding marked `recovery_required` or update its stale installation ID while preserving known CMS origins. The self-service enrollment and App setup flows can also recover the same immutable repository-ID binding after fresh installation and repository verification. This supports repository transfers, App repository-selection changes, and recovery when the old CMS origin is no longer available.
 
 ## Access Policy
 

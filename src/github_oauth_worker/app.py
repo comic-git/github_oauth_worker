@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlencode
 
@@ -19,8 +20,21 @@ from github_oauth_worker.bindings import (
     RepositoryBinding,
     canonicalize_origin,
 )
+from github_oauth_worker.cms_access import (
+    CMS_ACCESS_POLICY_PATH,
+    CmsAccessPolicyChange,
+    CmsAccessPolicyPlan,
+    CmsAccessPolicyPlanError,
+    load_cms_access_policy,
+    plan_cms_access_policy,
+)
+from github_oauth_worker.cms_access_delivery import (
+    current_policy_pull_request,
+    deliver_cms_access_policy,
+)
 from github_oauth_worker.cms_enablement import (
     CmsMigrationPreview,
+    MigrationPlanFile,
     TargetRepositoryState,
     build_migration_preview,
     compare_migration_files,
@@ -29,6 +43,7 @@ from github_oauth_worker.cms_enablement import (
     resolve_official_engine_commit,
 )
 from github_oauth_worker.cms_setup import (
+    render_cms_access_origins_page,
     render_cms_branch_selection_page,
     render_cms_discovery_page,
     render_cms_migration_result_page,
@@ -164,6 +179,15 @@ class CmsSetupBranchSelectionRequest(BaseModel):
 
     state: str
     target_branch: str
+
+
+class CmsSetupAccessReviewRequest(BaseModel):
+    """Creator-confirmed HTTPS origins submitted from a signed branch selection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: str
+    approved_origins: str = Field(min_length=1, max_length=4096)
 
 
 class OriginMigrationHandshakeRequest(BaseModel):
@@ -555,6 +579,9 @@ def create_app(
                 oauth_state.engine_selector,
                 oauth_state.engine_commit_sha,
                 oauth_state.reviewed_plan_digest,
+                approved_origins=oauth_state.approved_origins,
+                default_branch_commit_sha=oauth_state.default_branch_commit_sha,
+                reviewed_policy_digest=oauth_state.reviewed_policy_digest,
             )
             confirmed_state = app.state.state_manager.consume(
                 issued_state.token,
@@ -601,6 +628,59 @@ def create_app(
             )
             response = await run_setup_session_step(
                 request, oauth_state, branch_state, cms_enablement_branch_callback
+            )
+            if response is not None:
+                return response
+            return redirect_to_github(issued_state, oauth_state.repository_id)
+
+        @app.post("/setup/review-access")
+        async def setup_review_access(request: Request) -> Response:
+            """Bind the creator's explicit website approvals to the signed CMS review."""
+            if not worker_settings.cms_access_policy_setup_enabled:
+                raise WorkerError
+            selection = await _validated_form(request, CmsSetupAccessReviewRequest)
+            oauth_state = app.state.state_manager.consume_from_cookies(
+                selection.state, request.cookies
+            )
+            if oauth_state.flow is not OAuthFlow.CMS_ENABLEMENT_BRANCH:
+                raise WorkerError
+            assert oauth_state.repository_id is not None
+            assert oauth_state.installation_id is not None
+            assert oauth_state.target_branch is not None
+            try:
+                approved_origins = tuple(
+                    canonicalize_origin(line.strip())
+                    for line in selection.approved_origins.splitlines()
+                    if line.strip()
+                )
+                if not approved_origins:
+                    raise ValueError
+                issued_state = app.state.state_manager.issue_cms_enablement_branch(
+                    oauth_state.repository_id,
+                    oauth_state.installation_id,
+                    oauth_state.target_branch,
+                    correlation_nonce=oauth_state.nonce,
+                    approved_origins=approved_origins,
+                )
+            except ValueError:
+                error = CmsAccessPolicyPlanError()
+                return HTMLResponse(
+                    render_management_result_page(
+                        error.public_message,
+                        heading="comic_git CMS setup could not continue",
+                        diagnostic_code=error.diagnostic_code,
+                        retry_url="/setup",
+                        retry_label="Start CMS setup again",
+                    ),
+                    status_code=error.status_code,
+                )
+            reviewed_state = app.state.state_manager.consume(
+                issued_state.token,
+                issued_state.correlation_nonce,
+                OAuthFlow.CMS_ENABLEMENT_BRANCH,
+            )
+            response = await run_setup_session_step(
+                request, oauth_state, reviewed_state, cms_enablement_branch_callback
             )
             if response is not None:
                 return response
@@ -744,15 +824,11 @@ def create_app(
                     github_user.login,
                     AccessOperation.AUTHORIZATION,
                 )
-                try:
-                    repository = await app.state.github_client.verify_bound_repository_access(
-                        access_token.access_token,
-                        binding.installation_id,
-                        binding.repository_id,
-                    )
-                except GitHubAccessVerificationError:
-                    await app.state.binding_store.mark_recovery_required(binding.repository_id)
-                    raise
+                repository = await app.state.github_client.verify_bound_repository_access(
+                    access_token.access_token,
+                    binding.installation_id,
+                    binding.repository_id,
+                )
                 await app.state.binding_store.refresh_repository_metadata(
                     binding.repository_id,
                     repository.owner.login,
@@ -1110,6 +1186,79 @@ def create_app(
             )
             return target_state, preview
 
+        async def build_cms_access_review(
+            repository: GitHubRepository,
+            access_token: SecretStr,
+            target_branch: str,
+            approved_origins: tuple[str, ...],
+        ) -> tuple[CmsAccessPolicyPlan, str]:
+            """Pair the proposed policy with one stable default-branch revision."""
+            if repository.default_branch is None:
+                raise CmsAccessPolicyPlanError
+            branch_ref = f"heads/{repository.default_branch}"
+            before = await app.state.github_client.get_repository_ref(
+                access_token, repository, branch_ref
+            )
+            if before.object.type != "commit":
+                raise CmsAccessPolicyPlanError
+            existing = await app.state.github_client.get_default_branch_cms_access_policy(
+                access_token, repository
+            )
+            after = await app.state.github_client.get_repository_ref(
+                access_token, repository, branch_ref
+            )
+            if before.object.sha != after.object.sha:
+                raise CmsMigrationReviewChangedError
+            plan = plan_cms_access_policy(
+                existing_content=existing,
+                repository_id=repository.id,
+                default_branch=repository.default_branch,
+                target_branch=target_branch,
+                worker_origin=str(worker_settings.public_base_url),
+                approved_origins=approved_origins,
+            )
+            return plan, before.object.sha
+
+        def include_cms_access_policy(
+            preview: CmsMigrationPreview, plan: CmsAccessPolicyPlan
+        ) -> CmsMigrationPreview:
+            """Add the policy once, without overriding an engine-owned migration file."""
+            if CMS_ACCESS_POLICY_PATH in preview.changed_paths or any(
+                file.path == CMS_ACCESS_POLICY_PATH for file in preview.files
+            ):
+                raise CmsAccessPolicyPlanError
+            return replace(
+                preview,
+                files=(
+                    *preview.files,
+                    MigrationPlanFile(CMS_ACCESS_POLICY_PATH, plan.proposed_content),
+                ),
+                changed_paths=(*preview.changed_paths, CMS_ACCESS_POLICY_PATH),
+            )
+
+        async def existing_policy_pr_url(
+            repository: GitHubRepository,
+            access_token: SecretStr,
+            plan: CmsAccessPolicyPlan | None,
+            base_commit_sha: str | None,
+            *,
+            policy_only: bool,
+        ) -> str | None:
+            if (
+                plan is None
+                or base_commit_sha is None
+                or plan.change is CmsAccessPolicyChange.UNCHANGED
+                or (not plan.needs_separate_pull_request and not policy_only)
+            ):
+                return None
+            candidates = await app.state.github_client.list_open_repository_pull_requests(
+                access_token, repository, plan.default_branch
+            )
+            current = current_policy_pull_request(
+                candidates, repository, plan.default_branch, base_commit_sha
+            )
+            return current.html_url if current is not None else None
+
         async def open_migration_pull_requests(
             repository: GitHubRepository, access_token: SecretStr, target_branch: str
         ) -> tuple[GitHubPullRequestDetails, ...]:
@@ -1266,25 +1415,146 @@ def create_app(
             await app.state.github_client.require_repository_administrator(
                 access_token.access_token, repository, github_user.login
             )
+            if (
+                worker_settings.cms_access_policy_setup_enabled
+                and repository.default_branch is None
+            ):
+                raise CmsAccessPolicyPlanError
+            if (
+                worker_settings.cms_access_policy_setup_enabled
+                and oauth_state.approved_origins is None
+            ):
+                existing = await app.state.github_client.get_default_branch_cms_access_policy(
+                    access_token.access_token, repository
+                )
+                current_origins: tuple[str, ...] = ()
+                if existing is not None:
+                    current_policy = load_cms_access_policy(existing)
+                    if current_policy.repository_id != repository.id:
+                        raise CmsAccessPolicyPlanError
+                    current_origins = current_policy.authorized_origins
+                approval_state = app.state.state_manager.issue_cms_enablement_branch(
+                    repository.id,
+                    oauth_state.installation_id,
+                    oauth_state.target_branch,
+                    correlation_nonce=(
+                        authorization.nonce if isinstance(authorization, SetupSession) else None
+                    ),
+                )
+                response = HTMLResponse(
+                    render_cms_access_origins_page(
+                        approval_state.token,
+                        repository,
+                        oauth_state.target_branch,
+                        current_origins,
+                        str(worker_settings.public_base_url).rstrip("/"),
+                    )
+                )
+                app.state.state_manager.attach_correlation_cookie(response, approval_state)
+                if not isinstance(authorization, SetupSession):
+                    app.state.setup_sessions.attach(
+                        response,
+                        access_token.access_token,
+                        approval_state.correlation_nonce,
+                        installation_id=oauth_state.installation_id,
+                        repository_id=repository.id,
+                    )
+                return response
             target_state, preview = await build_logged_cms_migration_preview(
                 repository, access_token.access_token, oauth_state.target_branch
             )
+            policy_plan = None
+            default_commit_sha = None
+            if worker_settings.cms_access_policy_setup_enabled:
+                assert oauth_state.approved_origins is not None
+                policy_plan, default_commit_sha = await build_cms_access_review(
+                    repository,
+                    access_token.access_token,
+                    oauth_state.target_branch,
+                    oauth_state.approved_origins,
+                )
+                if policy_plan.default_branch == preview.target_branch:
+                    if default_commit_sha != preview.base_commit_sha:
+                        raise CmsMigrationReviewChangedError
+                    if (
+                        policy_plan.change is not CmsAccessPolicyChange.UNCHANGED
+                        and not preview.already_enabled
+                    ):
+                        preview = include_cms_access_policy(preview, policy_plan)
+            binding_repaired = False
             if preview.already_enabled:
+                existing_binding = await app.state.binding_store.get_binding(repository.id)
+                binding_repaired = existing_binding is not None and (
+                    existing_binding.status is not BindingStatus.ACTIVE
+                    or existing_binding.installation_id != oauth_state.installation_id
+                )
+                if binding_repaired:
+                    await app.state.binding_store.recover_binding(
+                        RepositoryBinding.create(
+                            repository_id=repository.id,
+                            repository_owner=repository.owner.login,
+                            repository_name=repository.name,
+                            installation_id=oauth_state.installation_id,
+                            origin=existing_binding.origins[0].origin,
+                        )
+                    )
+            if preview.already_enabled and (
+                policy_plan is None or policy_plan.change is CmsAccessPolicyChange.UNCHANGED
+            ):
                 log_event(
                     logger,
                     "cms_setup_already_enabled",
                     repository_id=repository.id,
                     target_branch=preview.target_branch,
                     engine_commit_sha=preview.engine_commit_sha,
+                    binding_repaired=binding_repaired,
                 )
                 response = HTMLResponse(
                     render_management_result_page(
                         f"CMS is already enabled for {repository.owner.login}/{repository.name} "
-                        f"on branch {preview.target_branch}. No migration pull request is needed.",
+                        f"on branch {preview.target_branch}. No migration pull request is needed."
+                        + (" The CMS connection was refreshed." if binding_repaired else ""),
                         heading="comic_git CMS is already enabled",
                     )
                 )
                 app.state.setup_sessions.clear(response)
+                return response
+            if preview.already_enabled:
+                assert policy_plan is not None
+                assert default_commit_sha is not None
+                policy_pr_url = await existing_policy_pr_url(
+                    repository,
+                    access_token.access_token,
+                    policy_plan,
+                    default_commit_sha,
+                    policy_only=True,
+                )
+                confirmation = app.state.state_manager.issue_cms_enablement_confirmation(
+                    repository.id,
+                    oauth_state.installation_id,
+                    preview.target_branch,
+                    preview.base_commit_sha,
+                    preview.engine_selector,
+                    preview.engine_commit_sha,
+                    _migration_plan_digest(preview),
+                    correlation_nonce=(
+                        authorization.nonce if isinstance(authorization, SetupSession) else None
+                    ),
+                    approved_origins=oauth_state.approved_origins,
+                    default_branch_commit_sha=default_commit_sha,
+                    reviewed_policy_digest=_policy_plan_digest(policy_plan),
+                )
+                response = HTMLResponse(
+                    render_cms_migration_summary_page(
+                        confirmation.token,
+                        repository,
+                        preview,
+                        (),
+                        access_policy_plan=policy_plan,
+                        existing_policy_pull_request_url=policy_pr_url,
+                    )
+                )
+                app.state.state_manager.attach_correlation_cookie(response, confirmation)
                 return response
             branch_name = migration_branch_name(preview.target_branch, preview.base_commit_sha)
             pull_requests = await open_migration_pull_requests(
@@ -1314,6 +1584,10 @@ def create_app(
                 and not changes
                 and _migration_body_has_engine_sha(current.body, preview.engine_commit_sha)
                 and not superseded
+                and (
+                    policy_plan is None
+                    or policy_plan.change is CmsAccessPolicyChange.UNCHANGED
+                )
             )
             confirmation = app.state.state_manager.issue_cms_enablement_confirmation(
                 repository.id,
@@ -1326,6 +1600,11 @@ def create_app(
                 correlation_nonce=(
                     authorization.nonce if isinstance(authorization, SetupSession) else None
                 ),
+                approved_origins=oauth_state.approved_origins,
+                default_branch_commit_sha=default_commit_sha,
+                reviewed_policy_digest=(
+                    _policy_plan_digest(policy_plan) if policy_plan is not None else None
+                ),
             )
             response = HTMLResponse(
                 render_cms_migration_summary_page(
@@ -1336,6 +1615,14 @@ def create_app(
                     current.html_url if current else None,
                     up_to_date,
                     superseded,
+                    access_policy_plan=policy_plan,
+                    existing_policy_pull_request_url=await existing_policy_pr_url(
+                        repository,
+                        access_token.access_token,
+                        policy_plan,
+                        default_commit_sha,
+                        policy_only=False,
+                    ),
                 )
             )
             app.state.state_manager.attach_correlation_cookie(response, confirmation)
@@ -1374,7 +1661,37 @@ def create_app(
             target_state, preview = await build_logged_cms_migration_preview(
                 repository, access_token.access_token, oauth_state.target_branch
             )
-            if preview.already_enabled:
+            policy_plan = None
+            policy_result = None
+            if worker_settings.cms_access_policy_setup_enabled:
+                if (
+                    oauth_state.approved_origins is None
+                    or oauth_state.default_branch_commit_sha is None
+                    or oauth_state.reviewed_policy_digest is None
+                ):
+                    raise CmsMigrationReviewChangedError
+                policy_plan, default_commit_sha = await build_cms_access_review(
+                    repository,
+                    access_token.access_token,
+                    oauth_state.target_branch,
+                    oauth_state.approved_origins,
+                )
+                if (
+                    default_commit_sha != oauth_state.default_branch_commit_sha
+                    or _policy_plan_digest(policy_plan) != oauth_state.reviewed_policy_digest
+                ):
+                    raise CmsMigrationReviewChangedError
+                if policy_plan.default_branch == preview.target_branch:
+                    if default_commit_sha != preview.base_commit_sha:
+                        raise CmsMigrationReviewChangedError
+                    if (
+                        policy_plan.change is not CmsAccessPolicyChange.UNCHANGED
+                        and not preview.already_enabled
+                    ):
+                        preview = include_cms_access_policy(preview, policy_plan)
+            if preview.already_enabled and (
+                policy_plan is None or policy_plan.change is CmsAccessPolicyChange.UNCHANGED
+            ):
                 raise CmsMigrationReviewChangedError
             if (
                 preview.target_branch != oauth_state.target_branch
@@ -1386,6 +1703,30 @@ def create_app(
             branch_name = migration_branch_name(preview.target_branch, preview.base_commit_sha)
             if _migration_plan_digest(preview) != oauth_state.reviewed_plan_digest:
                 raise CmsMigrationReviewChangedError
+            if preview.already_enabled:
+                assert policy_plan is not None
+                policy_result = await deliver_cms_access_policy(
+                    app.state.github_client,
+                    access_token.access_token,
+                    repository,
+                    policy_plan,
+                    oauth_state.default_branch_commit_sha,
+                )
+                return HTMLResponse(
+                    render_cms_migration_result_page(
+                        None,
+                        access_policy_pull_request_url=policy_result.pull_request_url,
+                        unremoved_policy_branches=policy_result.unremoved_branches,
+                    )
+                )
+            if policy_plan is not None and policy_plan.needs_separate_pull_request:
+                policy_result = await deliver_cms_access_policy(
+                    app.state.github_client,
+                    access_token.access_token,
+                    repository,
+                    policy_plan,
+                    oauth_state.default_branch_commit_sha,
+                )
             pull_requests = await open_migration_pull_requests(
                 repository, access_token.access_token, preview.target_branch
             )
@@ -1538,7 +1879,14 @@ def create_app(
             )
             return HTMLResponse(
                 render_cms_migration_result_page(
-                    pull_request.html_url, tuple(sorted(unremoved_branches))
+                    pull_request.html_url,
+                    tuple(sorted(unremoved_branches)),
+                    access_policy_pull_request_url=(
+                        policy_result.pull_request_url if policy_result is not None else None
+                    ),
+                    unremoved_policy_branches=(
+                        policy_result.unremoved_branches if policy_result is not None else ()
+                    ),
                 )
             )
 
@@ -1562,15 +1910,11 @@ def create_app(
                 github_user.login,
                 AccessOperation.AUTHORIZATION,
             )
-            try:
-                repository = await app.state.github_client.verify_bound_repository_access(
-                    access_token.access_token,
-                    oauth_state.installation_id,
-                    oauth_state.repository_id,
-                )
-            except GitHubAccessVerificationError:
-                await app.state.binding_store.mark_recovery_required(oauth_state.repository_id)
-                raise
+            repository = await app.state.github_client.verify_bound_repository_access(
+                access_token.access_token,
+                oauth_state.installation_id,
+                oauth_state.repository_id,
+            )
             await app.state.binding_store.refresh_repository_metadata(
                 oauth_state.repository_id,
                 repository.owner.login,
@@ -1696,15 +2040,11 @@ def create_app(
                     github_user.login,
                     AccessOperation.REFRESH,
                 )
-                try:
-                    repository = await app.state.github_client.verify_bound_repository_access(
-                        access_token.access_token,
-                        binding.installation_id,
-                        binding.repository_id,
-                    )
-                except GitHubAccessVerificationError:
-                    await app.state.binding_store.mark_recovery_required(binding.repository_id)
-                    raise
+                repository = await app.state.github_client.verify_bound_repository_access(
+                    access_token.access_token,
+                    binding.installation_id,
+                    binding.repository_id,
+                )
                 await app.state.binding_store.refresh_repository_metadata(
                     binding.repository_id,
                     repository.owner.login,
@@ -1756,6 +2096,12 @@ def _migration_plan_digest(preview: CmsMigrationPreview) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _policy_plan_digest(plan: CmsAccessPolicyPlan) -> str:
+    """Bind a signed confirmation to the default branch and exact proposed policy."""
+    content = f"{plan.default_branch}\0{plan.proposed_content}".encode()
+    return hashlib.sha256(content).hexdigest()
 
 
 def _matches_migration_branch(branch_name: str, base_name: str) -> bool:

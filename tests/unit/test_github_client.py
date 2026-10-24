@@ -1,6 +1,7 @@
 """Offline tests for bounded GitHub App client requests and response validation."""
 
 import asyncio
+import base64
 import json
 from typing import Any
 
@@ -170,6 +171,90 @@ def test_list_repository_branches_uses_bounded_pagination() -> None:
             "cms",
         ]
         assert [request.url.params["page"] for request in requests] == ["1", "2"]
+
+    asyncio.run(scenario())
+
+
+def test_cms_access_policy_read_uses_only_github_default_branch() -> None:
+    async def scenario() -> None:
+        content = b"schema_version = 1\n"
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "type": "file",
+                    "path": ".comic_git/cms_access.toml",
+                    "encoding": "base64",
+                    "size": len(content),
+                    "content": base64.encodebytes(content).decode("ascii"),
+                },
+            )
+
+        repository = _repository().model_copy(update={"default_branch": "old-branch"})
+        result = await _client(handler).get_default_branch_cms_access_policy(
+            SecretStr("user-access-token"), repository
+        )
+
+        assert result == content
+        assert len(requests) == 1
+        assert requests[0].url.path == "/repos/owner/comic/contents/.comic_git/cms_access.toml"
+        assert requests[0].url.query == b""
+        assert requests[0].headers["Authorization"] == "Bearer user-access-token"
+
+    asyncio.run(scenario())
+
+
+def test_missing_cms_access_policy_is_not_a_github_outage() -> None:
+    async def scenario() -> None:
+        client = _client(lambda _: httpx.Response(404, json={"message": "Not Found"}))
+        assert (
+            await client.get_default_branch_cms_access_policy(
+                SecretStr("user-access-token"), _repository()
+            )
+            is None
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"type": "dir", "path": ".comic_git/cms_access.toml"},
+        {
+            "type": "file",
+            "path": ".comic_git/other.toml",
+            "encoding": "base64",
+            "size": 1,
+            "content": "YQ==",
+        },
+        {
+            "type": "file",
+            "path": ".comic_git/cms_access.toml",
+            "encoding": "none",
+            "size": 1,
+            "content": "",
+        },
+        {
+            "type": "file",
+            "path": ".comic_git/cms_access.toml",
+            "encoding": "base64",
+            "size": 99,
+            "content": "YQ==",
+        },
+    ],
+)
+def test_malformed_cms_access_policy_responses_fail_closed(payload: Any) -> None:
+    async def scenario() -> None:
+        client = _client(lambda _: httpx.Response(200, json=payload))
+        with pytest.raises(GitHubClientError):
+            await client.get_default_branch_cms_access_policy(
+                SecretStr("user-access-token"), _repository()
+            )
 
     asyncio.run(scenario())
 

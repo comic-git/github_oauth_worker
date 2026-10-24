@@ -75,6 +75,7 @@ class WorkerSettings(BaseSettings):
     access_policy: AccessPolicyMode = AccessPolicyMode.GITHUB_LOGIN_WHITELIST
     github_login_whitelist: Annotated[frozenset[str], NoDecode] = frozenset()
     cms_minimum_engine_version: str = "1.2"
+    cms_access_policy_setup_enabled: bool = False
     cms_allowed_engine_branches: Annotated[frozenset[str], NoDecode] = frozenset(
         {"latest", "master"}
     )

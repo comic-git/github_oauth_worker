@@ -44,6 +44,9 @@ class OAuthState(BaseModel):
     engine_selector: str | None = None
     engine_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     reviewed_plan_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    approved_origins: tuple[str, ...] | None = Field(default=None, max_length=32)
+    default_branch_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    reviewed_policy_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_flow_context(self) -> OAuthState:
@@ -131,6 +134,23 @@ class OAuthState(BaseModel):
             and self.reviewed_plan_digest is not None
         ):
             raise ValueError("Only CMS confirmation state may contain a reviewed plan.")
+        if self.approved_origins is not None and self.flow not in (
+            OAuthFlow.CMS_ENABLEMENT_BRANCH,
+            OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+        ):
+            raise ValueError("Only branch-bound CMS state may contain approved origins.")
+        if (self.default_branch_commit_sha is None) != (self.reviewed_policy_digest is None):
+            raise ValueError("CMS policy review requires both its branch and content revision.")
+        if self.reviewed_policy_digest is not None and (
+            self.flow is not OAuthFlow.CMS_ENABLEMENT_CONFIRMATION
+            or self.approved_origins is None
+        ):
+            raise ValueError("Only a confirmed CMS policy review may carry its digest.")
+        if self.approved_origins is not None and (
+            not self.approved_origins
+            or sum(len(origin) for origin in self.approved_origins) > 4096
+        ):
+            raise ValueError("CMS approved origins exceed the signed-state bound.")
         return self
 
 
@@ -233,6 +253,9 @@ class OAuthStateManager:
         engine_commit_sha: str,
         reviewed_plan_digest: str,
         correlation_nonce: str | None = None,
+        approved_origins: tuple[str, ...] | None = None,
+        default_branch_commit_sha: str | None = None,
+        reviewed_policy_digest: str | None = None,
     ) -> IssuedOAuthState:
         """Bind confirmation to the exact reviewed target revision and engine source revision."""
         return self._issue_without_origin(
@@ -244,6 +267,9 @@ class OAuthStateManager:
             engine_selector=engine_selector,
             engine_commit_sha=engine_commit_sha,
             reviewed_plan_digest=reviewed_plan_digest,
+            approved_origins=approved_origins,
+            default_branch_commit_sha=default_branch_commit_sha,
+            reviewed_policy_digest=reviewed_policy_digest,
             correlation_nonce=correlation_nonce,
         )
 
@@ -253,6 +279,7 @@ class OAuthStateManager:
         installation_id: int,
         target_branch: str,
         correlation_nonce: str | None = None,
+        approved_origins: tuple[str, ...] | None = None,
     ) -> IssuedOAuthState:
         """Bind CMS migration planning to the creator-selected branch."""
         return self._issue_without_origin(
@@ -260,6 +287,7 @@ class OAuthStateManager:
             installation_id,
             repository_id,
             target_branch=target_branch,
+            approved_origins=approved_origins,
             correlation_nonce=correlation_nonce,
         )
 
@@ -377,6 +405,9 @@ class OAuthStateManager:
         engine_selector: str | None = None,
         engine_commit_sha: str | None = None,
         reviewed_plan_digest: str | None = None,
+        approved_origins: tuple[str, ...] | None = None,
+        default_branch_commit_sha: str | None = None,
+        reviewed_policy_digest: str | None = None,
         correlation_nonce: str | None = None,
     ) -> IssuedOAuthState:
         """Sign a direct GitHub App setup flow that deliberately has no CMS browser origin."""
@@ -391,6 +422,9 @@ class OAuthStateManager:
             engine_selector=engine_selector,
             engine_commit_sha=engine_commit_sha,
             reviewed_plan_digest=reviewed_plan_digest,
+            approved_origins=approved_origins,
+            default_branch_commit_sha=default_branch_commit_sha,
+            reviewed_policy_digest=reviewed_policy_digest,
         )
         token = self._serializer(flow).dumps(state.model_dump(mode="json"))
         return IssuedOAuthState(

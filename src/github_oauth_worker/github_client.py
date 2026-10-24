@@ -1,13 +1,16 @@
 """Bounded GitHub App user-token and repository-verification client."""
 
 import asyncio
+import base64
+import binascii
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
+from github_oauth_worker.cms_access import CMS_ACCESS_POLICY_PATH, MAX_CMS_ACCESS_POLICY_BYTES
 from github_oauth_worker.config import ConfigurationError, WorkerSettings
 from github_oauth_worker.errors import WorkerError, WorkerUnavailableError
 
@@ -57,6 +60,18 @@ class GitHubRepository(BaseModel):
     name: str = Field(min_length=1)
     owner: GitHubRepositoryOwner
     default_branch: str | None = Field(default=None, min_length=1)
+
+
+class _GitHubRepositoryContentFile(BaseModel):
+    """Only an ordinary, small file is valid as a CMS access-policy response."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    type: Literal["file"]
+    path: str
+    encoding: Literal["base64"]
+    size: int = Field(ge=0, le=MAX_CMS_ACCESS_POLICY_BYTES)
+    content: str
 
 
 class GitHubRepositoryBranch(BaseModel):
@@ -339,6 +354,37 @@ class GitHubAppClient:
             user_access_token,
         )
         return self._validate_response(GitHubRepository, response_data)
+
+    async def get_default_branch_cms_access_policy(
+        self,
+        user_access_token: SecretStr,
+        repository: GitHubRepository,
+    ) -> bytes | None:
+        """Read only the fixed policy path on GitHub's current default branch."""
+        response = await self._request(
+            "GET",
+            self._repository_url(
+                repository.owner.login, repository.name, f"/contents/{CMS_ACCESS_POLICY_PATH}"
+            ),
+            headers=self._api_headers(user_access_token),
+            allow_not_found=True,
+        )
+        if response.status_code == 404:
+            return None
+        try:
+            payload = response.json()
+            file = self._validate_response(_GitHubRepositoryContentFile, payload)
+            if (
+                file.path != CMS_ACCESS_POLICY_PATH
+                or len(file.content) > 2 * MAX_CMS_ACCESS_POLICY_BYTES
+            ):
+                raise GitHubClientError
+            content = base64.decodebytes(file.content.encode("ascii"))
+        except (ValueError, UnicodeEncodeError, binascii.Error, TypeError):
+            raise GitHubClientError from None
+        if len(content) != file.size:
+            raise GitHubClientError
+        return content
 
     async def list_repository_branches(
         self,

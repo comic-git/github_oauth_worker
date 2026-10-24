@@ -35,6 +35,7 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 - Map the production worker to a stable custom domain such as `oauth.comic-git.com`. Manage the domain, TLS, DNS records, load-balancer routing, and worker public URL through the production infrastructure configuration before publishing that URL to users.
 - On App installation or update, validate and reconcile worker-owned CMS configuration so reinstalling the App repairs incorrect repository, branch, or worker endpoint settings. Evaluate other narrowly scoped, safe automatic repairs separately.
 - Update the default starter-page guidance after CMS migration so it does not direct CMS users to edit legacy `info.ini`, `post.txt`, or transcript files that TOML now supersedes.
+- Explore a management dashboard for already-enabled sites, maintenance tasks, and recovery without requiring a working Decap editor. The design is provisional; see [CMS management dashboard exploration](management-dashboard.md).
 
 ## Documents
 
@@ -42,3 +43,6 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 - [GitHub App registration](github-app-registration.md) - Versioned App settings, permissions, setup/update verification, and policy boundaries.
 - [CMS enablement](cms-enablement.md) - Creator-facing installation and migration behavior.
 - [CMS setup manual verification](setup-manual-verification.md) - Numbered page-flow checks for installed, new, recovery, and PR lifecycle cases.
+- [CMS management dashboard exploration](management-dashboard.md) - Provisional maintenance use cases, possible UI locations, and authorization questions.
+- [CMS binding authority exploration](binding-store-exploration.md) - Firestore alternatives, an isolated repository-policy prototype, and remaining security decisions.
+- [Repository CMS access policy](access-policy-setup.md) - Provisional policy format, creator confirmation, and same-branch or two-branch setup behavior.
