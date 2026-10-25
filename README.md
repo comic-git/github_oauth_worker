@@ -39,6 +39,6 @@ Before creating or deploying a hosted worker, follow the owner setup in [`infra/
 | [`docs/infrastructure.md`](docs/infrastructure.md)              | GCP, Pulumi, environments, and secrets     |
 | [`docs/contributing.md`](docs/contributing.md)                  | Branching, review, and AI workflow         |
 | [`docs/features/cms-oauth/`](docs/features/cms-oauth/README.md) | CMS OAuth requirements and Decap contract  |
-| [`specs/backlog.md`](specs/backlog.md)                          | Deferred work and pre-release checks       |
+| [`docs/backlog.md`](docs/backlog.md)                            | Deferred work and pre-release checks       |
 
 See [`AGENTS.md`](AGENTS.md) for agent instructions and [`docs/contributing.md`](docs/contributing.md) for the development workflow.

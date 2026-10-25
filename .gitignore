@@ -8,5 +8,4 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
-specs/*
-!specs/backlog.md
+specs/

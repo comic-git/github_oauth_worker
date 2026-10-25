@@ -106,7 +106,7 @@ When a feature or fix is done, the right question is not "should I preserve the 
 - **Run `/update-docs`** to update existing docs that reflect changed behavior, interfaces, or conventions.
 - **Write a `docs/decisions/` entry** if the choice clears the bar in [Philosophy](#philosophy). The reasoning in the plan is ephemeral; a decision doc is permanent.
 - **Write a `docs/features/` entry** if there is intent, requirements, or business rules behind the feature that can't be derived from reading the implementation — applying the intent-over-implementation rule.
-- **Don't preserve temporary `specs/` plans and tasks.** Once the work is merged, delete them. Keep `specs/backlog.md` as the tracked index of deferred work and release checks; move durable feature intent and decisions into `docs/`.
+- **Don't preserve `specs/` plans and tasks.** Once the work is merged, delete them. Keep deferred work and release checks in `docs/backlog.md`; move durable feature intent and decisions into the appropriate `docs/` sections.
 
 ## Quick Decision Guide
 
