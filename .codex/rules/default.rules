@@ -31,3 +31,9 @@ prefix_rule(
     pattern = ["pulumi", "preview"],
     decision = "allow",
 )
+
+# AGENTS.md requires explicit human approval before each infrastructure apply.
+prefix_rule(
+    pattern = ["pulumi", "up"],
+    decision = "allow",
+)
