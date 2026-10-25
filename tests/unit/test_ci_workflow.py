@@ -35,7 +35,6 @@ def test_pulumi_applies_require_preview_and_protected_environment() -> None:
         else:
             assert "pulumi up" not in commands
         if job_name != "test":
-            assert "vars.PULUMI_CI_READY == 'true'" in job["if"]
             assert job["permissions"]["id-token"] == "write"
         else:
             assert "id-token" not in job.get("permissions", {})

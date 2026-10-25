@@ -109,10 +109,10 @@ Set these shared non-secret GitHub Actions repository variables:
 The stack YAML files already contain their KMS secrets-provider URL; the old
 `PULUMI_SECRETS_PROVIDER` repository variable is not used by this workflow.
 
-Leave the repository variable `PULUMI_CI_READY` unset until the bootstrap update, all four
-Environment variable sets, and both apply Environment reviewer rules have been checked. Set it
-to `true` only then. Without it, the workflow runs tests but skips all Pulumi jobs. Confirm
-the first automatic previews succeed before approving either pending apply. The `test`
+The `test` and `production` apply Environments must have required reviewers before enabling
+this workflow. Preview jobs start automatically and will fail until the bootstrap update and
+their Environment variables are in place. Confirm the first automatic previews succeed before
+approving either pending apply. The `test`
 Environment accepts trusted branches; restrict `production` to `master`. A stale branch head
 causes an approved apply job to fail rather than deploy old code.
 
@@ -159,7 +159,7 @@ Set the non-secret `githubAppSlug` to the slug in the App's GitHub public link t
 
 Both normal-stack files define the CMS engine-selector policy passed to their Cloud Run revision. `cmsMinimumEngineVersion` is the lowest released `X.Y` or `X.Y.Z` engine selector the worker will accept. `cmsAllowedEngineBranches` is the comma-separated list of moving official engine branches it will accept. Keep production limited to release-quality branches such as `latest,master`; test may include controlled development branches such as `cms`.
 
-Normal local development requires no GCP credentials. CI previews run automatically once enabled;
+Normal local development requires no GCP credentials. CI previews run automatically;
 apply jobs wait for GitHub Environment reviewer approval. Local Pulumi applies still require
 explicit human approval. GitHub-hosted apply runners provide Docker and use the short-lived
 deployment identity for the matching environment.

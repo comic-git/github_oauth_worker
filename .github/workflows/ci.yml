@@ -22,9 +22,8 @@ jobs:
 
   preview-test:
     if: >-
-      vars.PULUMI_CI_READY == 'true' &&
-      (github.event_name == 'push' ||
-      github.event.pull_request.head.repo.full_name == github.repository)
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     needs: test
     runs-on: ubuntu-latest
     environment: test-preview
@@ -57,7 +56,7 @@ jobs:
         working-directory: infra
 
   preview-production:
-    if: vars.PULUMI_CI_READY == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: test
     runs-on: ubuntu-latest
     environment: production-preview
@@ -90,7 +89,7 @@ jobs:
         working-directory: infra
 
   apply-test:
-    if: vars.PULUMI_CI_READY == 'true' && github.event_name == 'push'
+    if: github.event_name == 'push'
     needs: preview-test
     runs-on: ubuntu-latest
     environment: test
@@ -128,7 +127,7 @@ jobs:
         working-directory: infra
 
   apply-production:
-    if: vars.PULUMI_CI_READY == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: [preview-production, apply-test]
     runs-on: ubuntu-latest
     environment: production
