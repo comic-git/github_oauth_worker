@@ -9,6 +9,8 @@ This repository will provide the OAuth bridge for the Decap CMS integration in c
 
 The worker serves GitHub App OAuth for Decap and guides repository owners through CMS setup. Website authorization is defined by `.comic_git/cms_access.toml` on the repository's current default branch; the worker has no runtime database dependency. Start with the [infrastructure setup guide](infra/README.md) when deploying a worker.
 
+Creators should start at the deployed worker's `/setup` URL before installing its GitHub App. The worker guides them to GitHub to grant repository access when needed, then returns them to branch selection and migration review. See [CMS enablement](docs/features/cms-oauth/cms-enablement.md) for the full flow. Installing the App directly first is also supported.
+
 ```powershell
 py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
