@@ -4,7 +4,7 @@ This is the single index for unfinished worker work. Detailed contracts and test
 
 ## Before The First Public CMS Release
 
-- [ ] Implement CI in a separate PR after the CMS access-policy PR merges: run Ruff and the offline tests on PRs, preview Pulumi changes, and introduce test and production applies with deliberate deployment gates. The intended pipeline and credential boundaries are in [CI/CD](../docs/cicd.md).
+- [ ] Implement CI in a separate PR after the CMS access-policy PR merges: run Ruff and the offline tests on PRs, automatically preview test changes on trusted branches/PRs and production changes on `master`, and require manual workflow activation for either environment's apply. The intended pipeline and credential boundaries are in [CI/CD](../docs/cicd.md).
 - [ ] Deploy and validate the merged worker against the test GitHub App and real `comic_git_dev` branches. Run the numbered [setup checklist](../docs/features/cms-oauth/setup-manual-verification.md), including **B** (`/setup` before App installation), login and token refresh, policy-only setup, and two-PR setup for a non-default CMS branch. Record the tested worker and engine revisions.
 - [ ] Test the [shared-origin access rules](../docs/features/cms-oauth/README.md#ga-readiness) with two repositories and users under one GitHub Pages owner. Confirm that login and refresh verify the selected repository's App-installation membership and access policy, not merely public repository metadata.
 - [ ] Set a dedicated migration commit author name and email. Preserve the initiating creator in audit logs and the PR description; commit metadata must not be presented as proof of authorization.

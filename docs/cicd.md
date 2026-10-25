@@ -5,13 +5,13 @@
 
 ## Pipeline
 
-The initial pipeline has three required jobs for every commit and pull request:
+Automated jobs never apply infrastructure:
 
-1. `test` creates a venv, installs locked development dependencies, and runs formatting, static checks, and the offline test suite.
-2. `pulumi-preview-test` depends on `test` and runs a detailed Pulumi preview against the test stack.
-3. `pulumi-apply-test` depends on `pulumi-preview-test` and applies the reviewed test-stack change on commits to the default branch.
+1. `test` creates a venv, installs locked development dependencies, and runs formatting, static checks, and the offline test suite on commits and pull requests.
+2. `pulumi-preview-test` depends on `test` and automatically previews the test stack for trusted repository branches and pull requests.
+3. `pulumi-preview-production` depends on `test` and automatically previews the production stack on `master`. The production WIF provider currently trusts only `master`; fork pull requests must not receive deployment credentials.
 
-Production uses the same ordered preview then apply jobs, but production apply is manually dispatched. This repository currently has one developer, so the workflow does not require manually copying a preview identifier into the apply job. Preview logs remain the required review surface before applying infrastructure.
+Separate manually started jobs apply the test or production stack. The operator reviews the automatic preview before deliberately dispatching an apply for a named environment and ref. The apply job uses that environment's identity and runs a fresh preview for the selected ref before `pulumi up`; the initial automatic preview is not a promise that cloud state stayed unchanged. A push, pull request, successful preview, or PR merge must never start an apply by itself. Production applies are limited to `master`; test applies may use a selected trusted branch. GitHub Environment approval may add another gate but is not a substitute for manual job activation. This repository currently has one developer, so the workflow does not require copying a preview identifier into the apply job.
 
 ## Credentials and Boundaries
 

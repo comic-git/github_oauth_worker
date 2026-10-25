@@ -85,9 +85,10 @@ non-secret variable names, with values from its own bootstrap outputs:
 | `production` | `GCP_WIF_PROVIDER`    | `production_wif_provider`       |
 | `production` | `GCP_SERVICE_ACCOUNT` | `production_ci_service_account` |
 
-Configure the `production` environment to allow only `master` deployments and require reviewers
-before the future production apply job. Test does not require environment approval while the MVP
-deploys test changes from every branch.
+Configure the `production` environment to allow only `master` deployments. Both test and production
+apply jobs require a deliberate manual workflow dispatch; neither starts on a push or pull request.
+Environment reviewers may provide an additional approval gate, but cannot replace the manual start.
+Test previews may run on trusted branches and pull requests without applying their changes.
 
 Set these shared non-secret GitHub Actions repository variables:
 
