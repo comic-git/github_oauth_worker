@@ -30,13 +30,13 @@ def test_issued_state_requires_the_matching_cookie_nonce(
 
 
 def test_state_cannot_be_reused_for_a_different_flow(state_manager: OAuthStateManager) -> None:
-    issued_state = state_manager.issue_enrollment("https://cms.example.com")
+    issued_state = state_manager.issue_decap("https://cms.example.com", 123)
 
     with pytest.raises(InvalidOAuthStateError):
         state_manager.consume(
             issued_state.token,
             issued_state.correlation_nonce,
-            OAuthFlow.SETUP,
+            OAuthFlow.CMS_ENABLEMENT_DISCOVERY,
         )
 
 
@@ -114,11 +114,7 @@ def test_branch_bound_state_retains_the_selected_branch(state_manager: OAuthStat
 
 def _issue_state(state_manager: OAuthStateManager, flow: OAuthFlow):
     if flow is OAuthFlow.DECAP:
-        return state_manager.issue_decap("https://cms.example.com", 123, 456)
-    if flow is OAuthFlow.ENROLLMENT:
-        return state_manager.issue_enrollment("https://cms.example.com")
-    if flow is OAuthFlow.SETUP:
-        return state_manager.issue_setup("https://cms.example.com", 123, 456)
+        return state_manager.issue_decap("https://cms.example.com", 123)
     if flow is OAuthFlow.CMS_ENABLEMENT_DISCOVERY:
         return state_manager.issue(OAuthFlow.CMS_ENABLEMENT_DISCOVERY)
     if flow is OAuthFlow.CMS_ENABLEMENT_INSTALLATION:
@@ -131,9 +127,4 @@ def _issue_state(state_manager: OAuthStateManager, flow: OAuthFlow):
         return state_manager.issue_cms_enablement_confirmation(
             123, 456, "cms", "a" * 40, "cms", "b" * 40, "0" * 64
         )
-    return state_manager.issue_origin_migration(
-        "https://cms.example.com",
-        "https://new-cms.example.com",
-        123,
-        456,
-    )
+    raise AssertionError(f"Unsupported flow: {flow}")

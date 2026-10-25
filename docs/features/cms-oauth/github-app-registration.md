@@ -47,6 +47,8 @@ accident.
 
 Set the worker's `githubAppSlug` configuration to the slug from the App's public link so `/setup` can direct users to its GitHub installation screen. The App client ID does not provide an installation URL.
 
+Tell creators to start at the worker's `/setup` URL and use its **Add repository access on GitHub** link if their repository is not listed. Opening the App installation page directly remains supported as an alternate entry point; the App's Setup URL brings creators back to the worker.
+
 Run the [CMS setup manual verification checklist](setup-manual-verification.md), especially first installation (B), installation update (C), and direct GitHub installation (D). Check both the normal session-reuse path and the documented authorization fallback. A repository not installed on the App must never be offered as a verified setup choice.
 
 GitHub treats `installation_id` in a setup redirect as untrusted browser input. The worker's
@@ -61,7 +63,7 @@ verification step is mandatory even when GitHub initiated the redirect.
 
 App visibility does not replace the worker access policy. Even a private App needs the whitelist for
 an independent deployment, and even the shared App still requires a verified repository/origin
-binding before it returns a token.
+default-branch access policy before it returns a token.
 
 ## Secret Handling
 

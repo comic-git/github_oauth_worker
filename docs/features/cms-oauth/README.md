@@ -21,8 +21,8 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 
 ## GA Readiness
 
-- Support multiple repositories for one GitHub owner without making each editor repeat setup. Define the browser trust boundary first: GitHub Pages project sites under one owner share an origin, and neither a URL path nor a client-supplied repository selector isolates their JavaScript or Decap's origin-wide auth storage. Decide whether same-origin repositories are one trusted group or require distinct origins for independent security. Then make login, refresh, binding lookup or its replacement, and migration behavior consistent with that decision; test distinct repositories and users sharing an owner.
-- Verify on every authorization and refresh that GitHub lists the bound repository within the selected App installation for that user token. Fetching public repository metadata by ID alone does not prove installation membership. Keep the separate question of which repository permission level qualifies an editor explicit.
+- Validate the shared-origin security contract with browser tests. GitHub Pages project sites under one owner share an origin, so sites at that origin must be treated as one trusted browser group even though each repository has its own access policy. Test distinct repositories and users sharing an owner.
+- Verify on every authorization and refresh that GitHub lists the selected repository within an App installation accessible to the user token. Fetching public repository metadata by ID alone does not prove installation membership. Keep the separate question of which repository permission level qualifies an editor explicit.
 - Set migration commit author name and email to a dedicated worker identity without implying that metadata changes the authenticated GitHub actor. Keep the creator as the initiating actor in worker audit logs and reference that person in the PR description.
 - Present a named, accessible installation-progress view while the worker performs repository reads, engine resolution, migration planning, CMS configuration, commit creation, and pull-request creation. It must clearly distinguish a completed step, the active step, and a recoverable failure without exposing repository content or credentials.
 - Replace the generic JSON error for an expired CMS migration review with a clear expiry page and a retry action that resumes with the same repository and target branch. Retry must obtain fresh authorization, recheck access and branch availability, and rebuild the review from the current target state; an invalid or tampered state must not provide a preselected retry.
@@ -30,11 +30,11 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 
 ## Deferred Work
 
-- Let `/setup` enable CMS on an existing TOML-backed branch where CMS is still disabled, without rerunning legacy migration or silently discarding TOML comments. Classify mixed or partial configurations more precisely and offer actionable remediation. A matching, CMS-ready TOML branch already returns a successful no-op; merely containing TOML does not.
 - Provision a global external Application Load Balancer for the production worker before assigning its custom domain.
 - Map the production worker to a stable custom domain such as `oauth.comic-git.com`. Manage the domain, TLS, DNS records, load-balancer routing, and worker public URL through the production infrastructure configuration before publishing that URL to users.
-- On App installation or update, validate and reconcile worker-owned CMS configuration so reinstalling the App repairs incorrect repository, branch, or worker endpoint settings. Evaluate other narrowly scoped, safe automatic repairs separately.
+- Evaluate additional narrowly scoped maintenance and repair tasks beyond the worker-owned CMS settings handled during setup.
 - Update the default starter-page guidance after CMS migration so it does not direct CMS users to edit legacy `info.ini`, `post.txt`, or transcript files that TOML now supersedes.
+- Explore a management dashboard for already-enabled sites, maintenance tasks, and recovery without requiring a working Decap editor. The design is provisional; see [CMS management dashboard exploration](management-dashboard.md).
 
 ## Documents
 
@@ -42,3 +42,6 @@ This feature lets a comic_git site use Decap CMS with GitHub through a dedicated
 - [GitHub App registration](github-app-registration.md) - Versioned App settings, permissions, setup/update verification, and policy boundaries.
 - [CMS enablement](cms-enablement.md) - Creator-facing installation and migration behavior.
 - [CMS setup manual verification](setup-manual-verification.md) - Numbered page-flow checks for installed, new, recovery, and PR lifecycle cases.
+- [CMS management dashboard exploration](management-dashboard.md) - Provisional maintenance use cases, possible UI locations, and authorization questions.
+- [CMS binding authority exploration](binding-store-exploration.md) - Historical reasoning and prototype, not operational guidance.
+- [Repository CMS access policy](access-policy-setup.md) - Policy format, creator confirmation, and same-branch or two-branch setup behavior.

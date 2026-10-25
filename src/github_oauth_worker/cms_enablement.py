@@ -27,7 +27,7 @@ from github_oauth_worker.github_client import (
     GitHubRepository,
 )
 
-RUNNER_PROTOCOL_VERSION = 1
+RUNNER_PROTOCOL_VERSION = 2
 RUNNER_MODULE = "build.migration.runner"
 MAXIMUM_ARCHIVE_BYTES = 10 * 1024 * 1024
 MAXIMUM_ARCHIVE_FILES = 2_000
@@ -43,11 +43,14 @@ TEXT_SOURCE_SUFFIXES = frozenset({".ini", ".toml", ".txt", ".md", ".json"})
 IMAGE_SUFFIXES = frozenset(
     {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".gif", ".bmp", ".webp", ".webv", ".svg", ".eps"}
 )
-SUPPORTED_RUNNER_RUNTIME_PACKAGES = frozenset({"tomli-w"})
-RUNNER_FAILURE_CODES = frozenset({
-    "request_invalid", "internal_error", "cms_toml_not_enabled", "cms_settings_mismatch",
-    "cms_not_ready",
-})
+SUPPORTED_RUNNER_RUNTIME_PACKAGES = frozenset({"tomli-w", "tomlkit"})
+RUNNER_FAILURE_CODES = frozenset(
+    {
+        "request_invalid",
+        "internal_error",
+        "cms_not_ready",
+    }
+)
 
 
 def migration_branch_name(target_branch: str, base_commit_sha: str) -> str:
@@ -83,14 +86,6 @@ class CmsEnablementError(WorkerError):
         "migration_runner_failed": (
             "The configured comic_git engine could not prepare a CMS migration. Update to a "
             "compatible engine version and try again."
-        ),
-        "cms_toml_not_enabled": (
-            "This repository already uses TOML, but CMS is not enabled. Enabling CMS for an "
-            "existing TOML site is not supported by this setup flow yet."
-        ),
-        "cms_settings_mismatch": (
-            "CMS is enabled on this branch, but its repository, branch, or OAuth settings differ "
-            "from this worker. Review the existing comic_info.toml settings before retrying."
         ),
         "cms_not_ready": (
             "This TOML-backed branch does not pass the engine's CMS editing checks. "
@@ -436,9 +431,7 @@ def run_engine_migration(
     if result.returncode != 0:
         failure_code = parse_runner_failure_code(result.stderr)
         diagnostic_code = (
-            failure_code
-            if failure_code in {"cms_toml_not_enabled", "cms_settings_mismatch", "cms_not_ready"}
-            else "migration_runner_failed"
+            failure_code if failure_code == "cms_not_ready" else "migration_runner_failed"
         )
         raise CmsEnablementError(
             diagnostic_code,

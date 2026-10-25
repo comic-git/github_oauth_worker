@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import re
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -11,8 +12,9 @@ from fastapi import Response
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from github_oauth_worker.app import _migration_plan_digest, create_app
-from github_oauth_worker.bindings import BindingStatus, InMemoryBindingStore, RepositoryBinding
+from github_oauth_worker.app import _migration_plan_digest, _policy_plan_digest, create_app
+from github_oauth_worker.cms_access import plan_cms_access_policy
+from github_oauth_worker.cms_access_delivery import CmsAccessDeliveryResult
 from github_oauth_worker.cms_enablement import (
     CmsEnablementError,
     CmsMigrationPreview,
@@ -100,67 +102,9 @@ def test_expected_worker_errors_have_generic_browser_safe_responses() -> None:
     assert "sensitive deployment detail" not in response.text
 
 
-def test_ready_callback_requires_cookie_and_verifies_a_bound_repository() -> None:
-    store = InMemoryBindingStore()
-    asyncio.run(
-        store.create_binding(
-            RepositoryBinding.create(
-                repository_id=123,
-                repository_owner="owner",
-                repository_name="comic",
-                installation_id=456,
-                origin="https://cms.example.com",
-            )
-        )
-    )
-    app = create_app(_ready_settings(), binding_store=store, github_client=_FakeGitHubClient())
-    client = TestClient(app)
-
-    handshake_response = client.post(
-        "/auth/handshake",
-        data={"origin": "https://cms.example.com"},
-        follow_redirects=False,
-    )
-    assert handshake_response.status_code == 302
-    state = parse_qs(urlparse(handshake_response.headers["location"]).query)["state"][0]
-    cookie_value = handshake_response.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
-
-    missing_cookie_response = client.get(f"/callback?code=one-time-code&state={state}")
-    assert missing_cookie_response.status_code == 400
-
-    callback_response = client.get(
-        f"/callback?code=one-time-code&state={state}",
-        headers={"Cookie": f"oauth_correlation_decap={cookie_value}"},
-    )
-    assert callback_response.status_code == 200
-    assert 'const targetOrigin = "https://cms.example.com"' in callback_response.text
-    assert "authorization:github:success:" in callback_response.text
-
-
-def test_setup_handshake_form_navigates_to_github_with_cookie_bound_state() -> None:
-    client = TestClient(
-        create_app(
-            _ready_settings(),
-            binding_store=InMemoryBindingStore(),
-            github_client=_FakeGitHubClient(),
-        )
-    )
-
-    response = client.post(
-        "/setup/handshake",
-        data={"origin": "https://cms.example.com", "installation_id": "456"},
-        follow_redirects=False,
-    )
-
-    assert response.status_code == 302
-    assert response.headers["location"].startswith("https://github.com/login/oauth/authorize?")
-    assert "oauth_correlation_setup=" in response.headers["set-cookie"]
-
-
 def test_guided_setup_discovers_installed_repositories_before_selection() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app)
@@ -177,9 +121,7 @@ def test_guided_setup_discovers_installed_repositories_before_selection() -> Non
     state_token = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
     nonce = start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
     cookie = f"oauth_correlation_cms_enablement_discovery={nonce}"
-    state = app.state.state_manager.consume(
-        state_token, nonce, OAuthFlow.CMS_ENABLEMENT_DISCOVERY
-    )
+    state = app.state.state_manager.consume(state_token, nonce, OAuthFlow.CMS_ENABLEMENT_DISCOVERY)
     assert state.repository_id is None
     assert state.installation_id is None
 
@@ -236,7 +178,6 @@ def test_guided_setup_reuses_discovery_authorization_through_review(monkeypatch)
     monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app, base_url="https://worker.example.com")
@@ -284,14 +225,25 @@ def test_guided_setup_reuses_discovery_authorization_through_review(monkeypatch)
         follow_redirects=False,
     )
     assert review.status_code == 200
-    assert "Target branch: cms" in review.text
-    assert "Create migration pull request" in review.text
+    assert "Approve CMS websites" in review.text
+    origins_state = re.search('name="state" value="([^"]+)"', review.text)
+    assert origins_state is not None
+    summary = client.post(
+        "/setup/review-access",
+        data={
+            "state": origins_state.group(1),
+            "approved_origins": "https://cms.example.com",
+        },
+        follow_redirects=False,
+    )
+    assert summary.status_code == 200
+    assert "Target branch: cms" in summary.text
+    assert "Create migration pull request" in summary.text
 
 
 def test_guided_setup_rejects_a_tampered_session_on_branch_selection() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app, base_url="https://worker.example.com")
@@ -324,7 +276,6 @@ def test_guided_setup_rechecks_github_access_before_showing_branches() -> None:
     github_client = _FakeGitHubClient()
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=github_client,
     )
     client = TestClient(app, base_url="https://worker.example.com")
@@ -355,7 +306,6 @@ def test_guided_setup_rechecks_github_access_before_showing_branches() -> None:
 def test_guided_setup_falls_back_to_oauth_when_discovery_session_is_invalid() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app, base_url="https://worker.example.com")
@@ -377,7 +327,6 @@ def test_guided_setup_falls_back_to_oauth_when_discovery_session_is_invalid() ->
 def test_guided_setup_rejects_replaying_selected_session_for_another_repository() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app, base_url="https://worker.example.com")
@@ -411,7 +360,6 @@ def test_guided_setup_with_no_installations_offers_github_install() -> None:
 
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=NoInstallationsClient(),
     )
     client = TestClient(app)
@@ -447,7 +395,6 @@ def test_guided_setup_shows_repositories_from_multiple_installations() -> None:
 
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=MultipleInstallationsClient(),
     )
     client = TestClient(app)
@@ -482,7 +429,6 @@ def test_guided_setup_shows_repositories_from_multiple_installations() -> None:
 def test_guided_setup_cancellation_offers_a_safe_restart() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app)
@@ -503,7 +449,6 @@ def test_guided_setup_cancellation_offers_a_safe_restart() -> None:
 def test_guided_setup_rejects_selection_without_its_discovery_cookie() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     issued = app.state.state_manager.issue(OAuthFlow.CMS_ENABLEMENT_DISCOVERY)
@@ -525,98 +470,9 @@ def test_guided_setup_rejects_selection_without_its_discovery_cookie() -> None:
     assert invalid_selection.status_code == 400
 
 
-def test_ready_refresh_requires_a_bound_browser_origin_and_rechecks_github_access() -> None:
-    store = InMemoryBindingStore()
-    asyncio.run(
-        store.create_binding(
-            RepositoryBinding.create(
-                repository_id=123,
-                repository_owner="owner",
-                repository_name="comic",
-                installation_id=456,
-                origin="https://cms.example.com",
-            )
-        )
-    )
-    app = create_app(
-        _ready_settings(),
-        binding_store=store,
-        github_client=_FakeGitHubClient(),
-    )
-    client = TestClient(app)
-
-    response = client.post(
-        "/auth/refresh?provider=github",
-        content="refresh_token=refresh-token",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": "https://cms.example.com",
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json()["access_token"] == "access-token"
-    assert response.headers["access-control-allow-origin"] == "https://cms.example.com"
-
-    denied_response = client.post(
-        "/auth/refresh?provider=github",
-        content="refresh_token=refresh-token",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    assert denied_response.status_code == 400
-
-
-def test_unknown_origin_enrollment_requires_fresh_confirmation_before_binding() -> None:
-    store = InMemoryBindingStore()
-    client = TestClient(
-        create_app(
-            _ready_settings(),
-            binding_store=store,
-            github_client=_FakeGitHubClient(),
-        )
-    )
-
-    enrollment_start = client.post(
-        "/auth/handshake",
-        data={"origin": "https://new-cms.example.com"},
-        follow_redirects=False,
-    )
-    assert enrollment_start.status_code == 302
-    enrollment_state = parse_qs(urlparse(enrollment_start.headers["location"]).query)["state"][0]
-    enrollment_cookie = enrollment_start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
-
-    confirmation_page = client.get(
-        f"/callback?code=one-time-code&state={enrollment_state}",
-        headers={"Cookie": f"oauth_correlation_enrollment={enrollment_cookie}"},
-    )
-    assert confirmation_page.status_code == 200
-    assert "owner/comic" in confirmation_page.text
-
-    setup_start = client.post(
-        "/enroll/select",
-        content=f"state={enrollment_state}&selection=456%3A123",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Cookie": f"oauth_correlation_enrollment={enrollment_cookie}",
-        },
-        follow_redirects=False,
-    )
-    setup_state = parse_qs(urlparse(setup_start.headers["location"]).query)["state"][0]
-    setup_cookie = setup_start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
-
-    setup_callback = client.get(
-        f"/callback?code=one-time-code&state={setup_state}",
-        headers={"Cookie": f"oauth_correlation_setup={setup_cookie}"},
-    )
-    assert setup_callback.status_code == 200
-    assert "authorization:github:success:" in setup_callback.text
-    assert asyncio.run(store.get_binding_for_origin("https://new-cms.example.com")) is not None
-
-
 def test_app_setup_redirect_requires_fresh_authorization_for_its_same_installation() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app)
@@ -683,7 +539,6 @@ def test_app_setup_redirect_requires_fresh_authorization_for_its_same_installati
 def test_app_install_return_reuses_token_after_repository_selection() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app, base_url="https://worker.example.com")
@@ -709,7 +564,6 @@ def test_app_install_return_reuses_token_after_repository_selection() -> None:
 def test_app_install_return_reuses_discovery_authorization_when_installation_is_visible() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app, base_url="https://worker.example.com")
@@ -747,7 +601,6 @@ def test_app_install_return_reauthorizes_if_discovery_token_cannot_see_installat
     github_client = ChangedInstallationsClient()
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=github_client,
     )
     client = TestClient(app, base_url="https://worker.example.com")
@@ -766,7 +619,6 @@ def test_app_install_return_reauthorizes_if_discovery_token_cannot_see_installat
 def test_guided_setup_can_switch_github_accounts() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app, base_url="https://worker.example.com")
@@ -785,7 +637,6 @@ def test_guided_setup_can_switch_github_accounts() -> None:
 def test_cms_setup_confirmation_requires_the_reviewed_state_cookie() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app)
@@ -866,6 +717,8 @@ def test_session_confirmation_rechecks_access_and_clears_its_cookie(monkeypatch)
             )
 
         async def get_repository_ref(self, _token, _repository, ref):
+            if ref == "heads/main":
+                return await super().get_repository_ref(_token, _repository, ref)
             assert ref == f"heads/{branch_name}"
             return GitHubGitReference(
                 ref=f"refs/{ref}", object=GitHubGitObject(type="commit", sha="d" * 40)
@@ -882,13 +735,21 @@ def test_session_confirmation_rechecks_access_and_clears_its_cookie(monkeypatch)
     monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_target)
     monkeypatch.setattr("github_oauth_worker.app.resolve_official_engine_commit", resolve_engine)
     monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
+    policy_plan = _unchanged_policy_plan("cms")
     github_client = ExistingPrClient()
-    app = create_app(
-        _ready_settings(), binding_store=InMemoryBindingStore(), github_client=github_client
-    )
+    app = create_app(_ready_settings(), github_client=github_client)
     client = TestClient(app, base_url="https://worker.example.com")
     issued = app.state.state_manager.issue_cms_enablement_confirmation(
-        123, 456, "cms", base_sha, "cms", engine_sha, _migration_plan_digest(preview)
+        123,
+        456,
+        "cms",
+        base_sha,
+        "cms",
+        engine_sha,
+        _migration_plan_digest(preview),
+        approved_origins=_APPROVED_ORIGINS,
+        default_branch_commit_sha=base_sha,
+        reviewed_policy_digest=_policy_plan_digest(policy_plan),
     )
     client.cookies.set(issued.cookie_name, issued.correlation_nonce, path="/")
     setup_cookie = Response()
@@ -943,7 +804,7 @@ def test_cms_setup_review_uses_the_selected_branch_and_sets_its_confirmation_coo
     ) -> CmsMigrationPreview:
         assert cms_enablement["branch"] == "cms"
         assert cms_enablement["backend_base_url"] == "https://worker.example.com"
-        assert cms_enablement["backend_auth_endpoint"] == "auth"
+        assert cms_enablement["backend_auth_endpoint"] == "auth/123"
         return CmsMigrationPreview(
             base_commit_sha=state.base_commit_sha,
             target_branch=state.target_branch,
@@ -960,11 +821,12 @@ def test_cms_setup_review_uses_the_selected_branch_and_sets_its_confirmation_coo
     monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app)
-    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(
+        123, 456, "cms", approved_origins=_APPROVED_ORIGINS
+    )
 
     response = client.get(
         f"/callback?code=one-time-code&state={issued_state.token}",
@@ -1034,6 +896,8 @@ def test_cms_setup_review_links_existing_pr_and_shows_incremental_changes(monkey
             )
 
         async def get_repository_ref(self, _token, _repository, ref):
+            if ref == "heads/main":
+                return await super().get_repository_ref(_token, _repository, ref)
             assert ref == f"heads/{branch_name}"
             return GitHubGitReference(
                 ref=f"refs/{ref}", object=GitHubGitObject(type="commit", sha=head_sha)
@@ -1067,10 +931,11 @@ def test_cms_setup_review_links_existing_pr_and_shows_incremental_changes(monkey
     monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=ReviewClient(),
     )
-    issued = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+    issued = app.state.state_manager.issue_cms_enablement_branch(
+        123, 456, "cms", approved_origins=_APPROVED_ORIGINS
+    )
     response = TestClient(app).get(
         f"/callback?code=one-time-code&state={issued.token}",
         headers={"Cookie": f"{issued.cookie_name}={issued.correlation_nonce}"},
@@ -1188,22 +1053,32 @@ def test_cms_setup_replaces_old_target_revision_pr_after_new_pr_exists(
             if branch == old_branch:
                 assert self.old_closed
                 return (
-                    GitHubPullRequest(
-                        number=7,
-                        html_url="https://github.com/owner/comic/pull/7",
-                        state="open",
-                    ),
-                ) if cleanup_state == "shared" else ()
+                    (
+                        GitHubPullRequest(
+                            number=7,
+                            html_url="https://github.com/owner/comic/pull/7",
+                            state="open",
+                        ),
+                    )
+                    if cleanup_state == "shared"
+                    else ()
+                )
             assert branch == new_branch
             return (
-                GitHubPullRequest(
-                    number=6,
-                    html_url="https://github.com/owner/comic/pull/6",
-                    state="closed",
-                ),
-            ) if branch_state == "closed_pr" else ()
+                (
+                    GitHubPullRequest(
+                        number=6,
+                        html_url="https://github.com/owner/comic/pull/6",
+                        state="closed",
+                    ),
+                )
+                if branch_state == "closed_pr"
+                else ()
+            )
 
         async def get_repository_ref(self, _token, _repository, ref):
+            if ref == "heads/main":
+                return await super().get_repository_ref(_token, _repository, ref)
             assert ref == f"heads/{new_branch}"
             return GitHubGitReference(
                 ref=f"refs/{ref}", object=GitHubGitObject(type="commit", sha="8" * 40)
@@ -1253,11 +1128,15 @@ def test_cms_setup_replaces_old_target_revision_pr_after_new_pr_exists(
             self.events.append("old_branch_deleted")
 
     fake = ReplacementClient()
+    fake.default_sha = new_base
     monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_target)
     monkeypatch.setattr("github_oauth_worker.app.resolve_official_engine_commit", resolve_engine)
     monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
-    app = create_app(_ready_settings(), binding_store=InMemoryBindingStore(), github_client=fake)
-    reviewed = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+    policy_plan = _unchanged_policy_plan("cms")
+    app = create_app(_ready_settings(), github_client=fake)
+    reviewed = app.state.state_manager.issue_cms_enablement_branch(
+        123, 456, "cms", approved_origins=_APPROVED_ORIGINS
+    )
     review = TestClient(app).get(
         f"/callback?code=one-time-code&state={reviewed.token}",
         headers={"Cookie": f"{reviewed.cookie_name}={reviewed.correlation_nonce}"},
@@ -1275,6 +1154,9 @@ def test_cms_setup_replaces_old_target_revision_pr_after_new_pr_exists(
         "cms",
         "d" * 40,
         _migration_plan_digest(asyncio.run(build_preview())),
+        approved_origins=_APPROVED_ORIGINS,
+        default_branch_commit_sha=new_base,
+        reviewed_policy_digest=_policy_plan_digest(policy_plan),
     )
     result = TestClient(app).get(
         f"/callback?code=one-time-code&state={confirmation.token}",
@@ -1301,11 +1183,12 @@ def test_cms_branch_callback_returns_a_safe_page_for_a_migration_error(monkeypat
     monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", fail_target_state)
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app)
-    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(
+        123, 456, "cms", approved_origins=("https://cms.example.com",)
+    )
 
     response = client.get(
         f"/callback?code=one-time-code&state={issued_state.token}",
@@ -1337,10 +1220,11 @@ def test_cms_branch_callback_rejects_an_old_engine_before_loading_source(monkeyp
     )
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
-    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(
+        123, 456, "cms", approved_origins=("https://cms.example.com",)
+    )
 
     response = TestClient(app).get(
         f"/callback?code=one-time-code&state={issued_state.token}",
@@ -1351,56 +1235,6 @@ def test_cms_branch_callback_rejects_an_old_engine_before_loading_source(monkeyp
     assert "engine_version_too_old" in response.text
     assert "1.2 or newer" in response.text
     assert "1.1" in response.text
-
-
-def test_cms_branch_callback_reports_an_already_enabled_site_without_a_pr(monkeypatch) -> None:
-    async def read_target(*_args: object) -> TargetRepositoryState:
-        return TargetRepositoryState(
-            base_commit_sha="a" * 40,
-            target_branch="cms",
-            tree=GitHubGitTree(sha="b" * 40, tree=()),
-            config_path="your_content/comic_info.toml",
-            engine_selector="cms",
-        )
-
-    async def resolve_engine(*_args: object) -> str:
-        return "c" * 40
-
-    async def build_preview(*_args: object) -> CmsMigrationPreview:
-        return CmsMigrationPreview(
-            base_commit_sha="a" * 40,
-            target_branch="cms",
-            engine_selector="cms",
-            engine_commit_sha="c" * 40,
-            changed_paths=(),
-            files=(),
-            already_enabled=True,
-        )
-
-    class NoPullRequestClient(_FakeGitHubClient):
-        async def list_open_repository_pull_requests(self, *_args):
-            pytest.fail("Already-enabled setup must not inspect or create migration PRs")
-
-    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_target)
-    monkeypatch.setattr("github_oauth_worker.app.resolve_official_engine_commit", resolve_engine)
-    monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
-    app = create_app(
-        _ready_settings(),
-        binding_store=InMemoryBindingStore(),
-        github_client=NoPullRequestClient(),
-    )
-    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
-
-    response = TestClient(app).get(
-        f"/callback?code=one-time-code&state={issued_state.token}",
-        headers={"Cookie": f"{issued_state.cookie_name}={issued_state.correlation_nonce}"},
-    )
-
-    assert response.status_code == 200
-    assert "comic_git CMS is already enabled" in response.text
-    assert "owner/comic" in response.text
-    assert "No migration pull request is needed" in response.text
-    assert "Create migration pull request" not in response.text
 
 
 def test_cms_branch_callback_logs_safe_migration_diagnostics(monkeypatch) -> None:
@@ -1421,11 +1255,12 @@ def test_cms_branch_callback_logs_safe_migration_diagnostics(monkeypatch) -> Non
     monkeypatch.setattr("github_oauth_worker.app.log_event", capture_log_event)
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app)
-    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(
+        123, 456, "cms", approved_origins=("https://cms.example.com",)
+    )
 
     response = client.get(
         f"/callback?code=one-time-code&state={issued_state.token}",
@@ -1445,11 +1280,12 @@ def test_cms_branch_callback_hides_an_unexpected_error_without_a_traceback(monke
     monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", fail_target_state)
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app)
-    issued_state = app.state.state_manager.issue_cms_enablement_branch(123, 456, "cms")
+    issued_state = app.state.state_manager.issue_cms_enablement_branch(
+        123, 456, "cms", approved_origins=("https://cms.example.com",)
+    )
 
     response = client.get(
         f"/callback?code=one-time-code&state={issued_state.token}",
@@ -1465,7 +1301,6 @@ def test_cms_branch_callback_hides_an_unexpected_error_without_a_traceback(monke
 def test_cms_setup_callback_renders_a_safe_error_without_a_decap_origin() -> None:
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=_FakeGitHubClient(),
     )
     client = TestClient(app)
@@ -1565,6 +1400,8 @@ def test_cms_setup_revises_an_untouched_existing_pull_request(
             )
 
         async def get_repository_ref(self, _token, _repository, ref):
+            if ref == "heads/main":
+                return await super().get_repository_ref(_token, _repository, ref)
             assert ref == f"heads/{branch_name}"
             return GitHubGitReference(
                 ref=f"refs/{ref}", object=GitHubGitObject(type="commit", sha=self.head_sha)
@@ -1651,9 +1488,9 @@ def test_cms_setup_revises_an_untouched_existing_pull_request(
     monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_target)
     monkeypatch.setattr("github_oauth_worker.app.resolve_official_engine_commit", resolve_engine)
     monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
+    policy_plan = _unchanged_policy_plan("cms")
     app = create_app(
         _ready_settings(),
-        binding_store=InMemoryBindingStore(),
         github_client=fake,
     )
     reviewed_digest = _migration_plan_digest(
@@ -1674,6 +1511,9 @@ def test_cms_setup_revises_an_untouched_existing_pull_request(
         "cms",
         new_engine,
         "0" * 64 if plan_changed else reviewed_digest,
+        approved_origins=_APPROVED_ORIGINS,
+        default_branch_commit_sha=base_sha,
+        reviewed_policy_digest=_policy_plan_digest(policy_plan),
     )
     response = TestClient(app).get(
         f"/callback?code=one-time-code&state={issued.token}",
@@ -1690,7 +1530,16 @@ def test_cms_setup_revises_an_untouched_existing_pull_request(
         assert "cms_migration_retry" in response.text
         assert "/setup?installation_id=456" in response.text
         issued = app.state.state_manager.issue_cms_enablement_confirmation(
-            123, 456, "cms", base_sha, "cms", new_engine, reviewed_digest
+            123,
+            456,
+            "cms",
+            base_sha,
+            "cms",
+            new_engine,
+            reviewed_digest,
+            approved_origins=_APPROVED_ORIGINS,
+            default_branch_commit_sha=base_sha,
+            reviewed_policy_digest=_policy_plan_digest(policy_plan),
         )
         response = TestClient(app).get(
             f"/callback?code=one-time-code&state={issued.token}",
@@ -1700,7 +1549,16 @@ def test_cms_setup_revises_an_untouched_existing_pull_request(
         assert response.status_code == 409
         assert "cms_migration_retry" in response.text
         issued = app.state.state_manager.issue_cms_enablement_confirmation(
-            123, 456, "cms", base_sha, "cms", new_engine, reviewed_digest
+            123,
+            456,
+            "cms",
+            base_sha,
+            "cms",
+            new_engine,
+            reviewed_digest,
+            approved_origins=_APPROVED_ORIGINS,
+            default_branch_commit_sha=base_sha,
+            reviewed_policy_digest=_policy_plan_digest(policy_plan),
         )
         response = TestClient(app).get(
             f"/callback?code=one-time-code&state={issued.token}",
@@ -1712,87 +1570,6 @@ def test_cms_setup_revises_an_untouched_existing_pull_request(
     assert fake.created_pull_requests == 0
     if edited_body:
         assert "Manual note" in fake.updated_body
-
-
-def test_origin_migration_uses_the_exact_destination_handshake_before_activation() -> None:
-    store = InMemoryBindingStore()
-    asyncio.run(
-        store.create_binding(
-            RepositoryBinding.create(
-                repository_id=123,
-                repository_owner="owner",
-                repository_name="comic",
-                installation_id=456,
-                origin="https://old-cms.example.com",
-            )
-        )
-    )
-    client = TestClient(
-        create_app(_ready_settings(), binding_store=store, github_client=_FakeGitHubClient())
-    )
-
-    start = client.post(
-        "/origins/migrate/handshake",
-        data={
-            "origin": "https://old-cms.example.com",
-            "target_origin": "https://new-cms.example.com",
-        },
-        follow_redirects=False,
-    )
-    assert start.status_code == 302
-    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
-    cookie = start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
-
-    prepared = client.get(
-        f"/callback?code=one-time-code&state={state}",
-        headers={"Cookie": f"oauth_correlation_origin_migration={cookie}"},
-    )
-    assert prepared.status_code == 200
-    assert awaitable_result(store.get_binding_for_origin("https://new-cms.example.com")) is None
-
-    complete = client.post(
-        "/origins/complete/handshake",
-        data={"origin": "https://new-cms.example.com"},
-    )
-    assert complete.status_code == 200
-    assert awaitable_result(store.get_binding_for_origin("https://new-cms.example.com")) is not None
-
-
-def test_failed_github_verification_marks_the_binding_for_recovery() -> None:
-    store = InMemoryBindingStore()
-    asyncio.run(
-        store.create_binding(
-            RepositoryBinding.create(
-                repository_id=123,
-                repository_owner="owner",
-                repository_name="comic",
-                installation_id=456,
-                origin="https://cms.example.com",
-            )
-        )
-    )
-    client = TestClient(
-        create_app(
-            _ready_settings(),
-            binding_store=store,
-            github_client=_FakeGitHubClient(fail_repository_verification=True),
-        )
-    )
-
-    start = client.post(
-        "/auth/handshake",
-        data={"origin": "https://cms.example.com"},
-        follow_redirects=False,
-    )
-    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
-    cookie = start.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
-    response = client.get(
-        f"/callback?code=one-time-code&state={state}",
-        headers={"Cookie": f"oauth_correlation_decap={cookie}"},
-    )
-
-    assert response.status_code == 400
-    assert awaitable_result(store.get_binding(123)).status is BindingStatus.RECOVERY_REQUIRED
 
 
 def _ready_settings() -> WorkerSettings:
@@ -1809,9 +1586,28 @@ def _ready_settings() -> WorkerSettings:
     )
 
 
-def awaitable_result(awaitable):
-    """Run the small async store assertions without introducing an async HTTP-test framework."""
-    return asyncio.run(awaitable)
+_APPROVED_ORIGINS = ("https://cms.example.com",)
+
+
+def _unchanged_policy_plan(target_branch: str):
+    proposed = plan_cms_access_policy(
+        existing_content=None,
+        repository_id=123,
+        default_branch="main",
+        target_branch=target_branch,
+        worker_origin="https://worker.example.com",
+        approved_origins=_APPROVED_ORIGINS,
+    )
+    unchanged = plan_cms_access_policy(
+        existing_content=proposed.proposed_content.encode(),
+        repository_id=123,
+        default_branch="main",
+        target_branch=target_branch,
+        worker_origin="https://worker.example.com",
+        approved_origins=_APPROVED_ORIGINS,
+    )
+
+    return unchanged
 
 
 class _FakeGitHubClient:
@@ -1872,6 +1668,16 @@ class _FakeGitHubClient:
     async def list_open_repository_pull_requests(self, _token, _repository, _base):
         return ()
 
+    async def get_default_branch_cms_access_policy(self, _token, _repository):
+        return _unchanged_policy_plan("cms").proposed_content.encode()
+
+    async def get_repository_ref(self, _token, _repository, ref):
+        assert ref == "heads/main"
+        return GitHubGitReference(
+            ref="refs/heads/main",
+            object=GitHubGitObject(type="commit", sha=getattr(self, "default_sha", "a" * 40)),
+        )
+
     async def verify_bound_repository_access(
         self,
         user_access_token: SecretStr,
@@ -1915,3 +1721,233 @@ class _FakeInstallation:
 
     def __init__(self, id: int) -> None:
         self.id = id
+
+
+def _access_setup_case(
+    monkeypatch,
+    *,
+    target_branch: str = "cms",
+    already_enabled: bool = False,
+    policy_file_collision: bool = False,
+):
+    base_sha = "a" * 40
+
+    async def read_target(_client, _token, _repository, branch):
+        assert branch == target_branch
+        return TargetRepositoryState(
+            base_commit_sha=base_sha,
+            target_branch=branch,
+            tree=GitHubGitTree(sha="b" * 40, tree=()),
+            config_path="your_content/comic_info.toml",
+            engine_selector="cms",
+        )
+
+    async def resolve_engine(*_args):
+        return "c" * 40
+
+    async def build_preview(*_args):
+        return CmsMigrationPreview(
+            base_commit_sha=base_sha,
+            target_branch=target_branch,
+            engine_selector="cms",
+            engine_commit_sha="c" * 40,
+            changed_paths=(
+                ()
+                if already_enabled
+                else ("your_content/comic_info.toml",)
+                + ((".comic_git/cms_access.toml",) if policy_file_collision else ())
+            ),
+            files=(
+                ()
+                if already_enabled
+                else (MigrationPlanFile("your_content/comic_info.toml", "cms = true\n"),)
+                + (
+                    (MigrationPlanFile(".comic_git/cms_access.toml", "unexpected = true\n"),)
+                    if policy_file_collision
+                    else ()
+                )
+            ),
+            already_enabled=already_enabled,
+        )
+
+    class AccessPolicyClient(_FakeGitHubClient):
+        def __init__(self):
+            super().__init__()
+            self.default_sha = base_sha
+
+        async def get_default_branch_cms_access_policy(self, _token, _repository):
+            return None
+
+        async def get_repository_ref(self, _token, _repository, ref):
+            assert ref == "heads/main"
+            return GitHubGitReference(
+                ref="refs/heads/main",
+                object=GitHubGitObject(type="commit", sha=self.default_sha),
+            )
+
+    monkeypatch.setattr("github_oauth_worker.app.read_target_repository_state", read_target)
+    monkeypatch.setattr("github_oauth_worker.app.resolve_official_engine_commit", resolve_engine)
+    monkeypatch.setattr("github_oauth_worker.app.build_migration_preview", build_preview)
+    github_client = AccessPolicyClient()
+    settings = _ready_settings()
+    app = create_app(
+        settings,
+        github_client=github_client,
+    )
+    client = TestClient(app, base_url="https://worker.example.com")
+    state = app.state.state_manager.issue_cms_enablement_branch(123, 456, target_branch)
+    origins_page = client.get(
+        f"/callback?code=one-time-code&state={state.token}",
+        headers={"Cookie": f"{state.cookie_name}={state.correlation_nonce}"},
+    )
+    assert origins_page.status_code == 200
+    assert "Approve CMS websites" in origins_page.text
+    origin_state = re.search('name="state" value="([^"]+)"', origins_page.text)
+    assert origin_state is not None
+    review = client.post(
+        "/setup/review-access",
+        data={
+            "state": origin_state.group(1),
+            "approved_origins": "https://owner.github.io\nhttps://comic.example.com",
+        },
+        follow_redirects=False,
+    )
+    return app, client, github_client, review
+
+
+def test_access_policy_review_is_signed_and_requires_a_separate_pr(monkeypatch) -> None:
+    app, client, _, review = _access_setup_case(monkeypatch)
+
+    assert review.status_code == 200
+    assert "A separate access-policy pull request" in review.text
+    assert "https://comic.example.com" in review.text
+    assert "Prepare CMS pull requests" in review.text
+    confirmation_state = re.search('name="state" value="([^"]+)"', review.text)
+    assert confirmation_state is not None
+    verified = app.state.state_manager.consume_from_cookies(
+        confirmation_state.group(1), client.cookies
+    )
+    assert verified.approved_origins == (
+        "https://owner.github.io",
+        "https://comic.example.com",
+    )
+    assert verified.default_branch_commit_sha == "a" * 40
+    assert verified.reviewed_policy_digest is not None
+
+
+def test_default_branch_setup_combines_policy_and_migration_files(monkeypatch) -> None:
+    _, _, _, review = _access_setup_case(monkeypatch, target_branch="main")
+
+    assert review.status_code == 200
+    assert ".comic_git/cms_access.toml" in review.text
+    assert "The access policy will be included in this pull request" in review.text
+    assert "A separate access-policy pull request" not in review.text
+
+
+def test_default_branch_setup_rejects_engine_policy_file_collision(monkeypatch) -> None:
+    _, _, _, review = _access_setup_case(
+        monkeypatch, target_branch="main", policy_file_collision=True
+    )
+
+    assert review.status_code == 400
+    assert "cms_access_plan_invalid" in review.text
+
+
+def test_access_policy_confirmation_rejects_a_changed_default_branch(monkeypatch) -> None:
+    _, client, github_client, review = _access_setup_case(monkeypatch)
+    confirmation_state = re.search('name="state" value="([^"]+)"', review.text)
+    assert confirmation_state is not None
+    github_client.default_sha = "f" * 40
+
+    result = client.post(
+        "/setup/confirm", data={"state": confirmation_state.group(1)}, follow_redirects=False
+    )
+
+    assert result.status_code == 409
+    assert "changed" in result.text
+
+
+def test_access_review_reports_invalid_origin_in_a_browser_page(monkeypatch) -> None:
+    app, client, _, _ = _access_setup_case(monkeypatch)
+    nonce = client.cookies["oauth_correlation_cms_enablement_branch"]
+    state = app.state.state_manager.issue_cms_enablement_branch(
+        123, 456, "cms", correlation_nonce=nonce
+    )
+
+    result = client.post(
+        "/setup/review-access",
+        data={"state": state.token, "approved_origins": "http://comic.example.com"},
+        follow_redirects=False,
+    )
+
+    assert result.status_code == 400
+    assert "cms_access_plan_invalid" in result.text
+    assert 'href="/setup"' in result.text
+
+
+def test_already_enabled_site_gets_policy_only_review_and_result(monkeypatch) -> None:
+    _, client, _, review = _access_setup_case(monkeypatch, already_enabled=True)
+    assert review.status_code == 200
+    assert "Only website access approval needs a pull request" in review.text
+    assert "Create access-policy pull request" in review.text
+    delivery = AsyncMock(
+        return_value=CmsAccessDeliveryResult("https://github.com/owner/comic/pull/12")
+    )
+    monkeypatch.setattr("github_oauth_worker.app.deliver_cms_access_policy", delivery)
+    confirmation_state = re.search('name="state" value="([^"]+)"', review.text)
+    assert confirmation_state is not None
+
+    result = client.post(
+        "/setup/confirm", data={"state": confirmation_state.group(1)}, follow_redirects=False
+    )
+
+    assert result.status_code == 200
+    assert "https://github.com/owner/comic/pull/12" in result.text
+    assert "Review migration pull request" not in result.text
+    delivery.assert_awaited_once()
+
+
+@pytest.mark.parametrize("target_branch", ["cms", "main"])
+def test_access_policy_confirmation_creates_the_expected_prs(monkeypatch, target_branch) -> None:
+    _, client, github_client, review = _access_setup_case(monkeypatch, target_branch=target_branch)
+    delivery = AsyncMock(
+        return_value=CmsAccessDeliveryResult("https://github.com/owner/comic/pull/12")
+    )
+    monkeypatch.setattr("github_oauth_worker.app.deliver_cms_access_policy", delivery)
+    github_client.find_repository_ref = AsyncMock(return_value=None)
+    github_client.create_repository_blobs = AsyncMock(return_value=())
+    github_client.create_repository_tree = AsyncMock(
+        return_value=GitHubGitTree(sha="e" * 40, tree=())
+    )
+    github_client.create_repository_commit = AsyncMock(
+        return_value=GitHubGitCommit(sha="f" * 40, tree=GitHubGitSha(sha="e" * 40))
+    )
+    github_client.create_repository_branch = AsyncMock()
+    github_client.create_repository_pull_request = AsyncMock(
+        return_value=GitHubPullRequest(
+            number=13,
+            html_url="https://github.com/owner/comic/pull/13",
+            state="open",
+        )
+    )
+    confirmation_state = re.search('name="state" value="([^"]+)"', review.text)
+    assert confirmation_state is not None
+
+    result = client.post(
+        "/setup/confirm", data={"state": confirmation_state.group(1)}, follow_redirects=False
+    )
+
+    assert result.status_code == 200
+    assert "https://github.com/owner/comic/pull/13" in result.text
+    paths = {change.path for change in github_client.create_repository_blobs.await_args.args[2]}
+    if target_branch == "cms":
+        delivery.assert_awaited_once()
+        assert "https://github.com/owner/comic/pull/12" in result.text
+        assert paths == {"your_content/comic_info.toml"}
+    else:
+        delivery.assert_not_awaited()
+        assert "https://github.com/owner/comic/pull/12" not in result.text
+        assert paths == {
+            "your_content/comic_info.toml",
+            ".comic_git/cms_access.toml",
+        }

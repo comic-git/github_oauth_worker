@@ -18,14 +18,11 @@ class OAuthFlow(StrEnum):
     """Browser flows that must not be allowed to consume one another's state."""
 
     DECAP = "decap"
-    ENROLLMENT = "enrollment"
-    SETUP = "setup"
     CMS_ENABLEMENT_DISCOVERY = "cms_enablement_discovery"
     CMS_ENABLEMENT_INSTALLATION = "cms_enablement_installation"
     CMS_ENABLEMENT_REPOSITORY = "cms_enablement_repository"
     CMS_ENABLEMENT_BRANCH = "cms_enablement_branch"
     CMS_ENABLEMENT_CONFIRMATION = "cms_enablement_confirmation"
-    ORIGIN_MIGRATION = "origin_migration"
 
 
 class OAuthState(BaseModel):
@@ -36,7 +33,6 @@ class OAuthState(BaseModel):
     flow: OAuthFlow
     nonce: str
     origin: str | None = None
-    target_origin: str | None = None
     repository_id: int | None = Field(default=None, gt=0)
     installation_id: int | None = Field(default=None, gt=0)
     target_branch: str | None = Field(default=None, min_length=1)
@@ -44,18 +40,19 @@ class OAuthState(BaseModel):
     engine_selector: str | None = None
     engine_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     reviewed_plan_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    approved_origins: tuple[str, ...] | None = Field(default=None, max_length=32)
+    default_branch_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    reviewed_policy_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_flow_context(self) -> OAuthState:
         """Require each state flow to carry only the signed context its callback needs."""
-        context = (self.origin, self.repository_id, self.installation_id)
-        if self.flow is OAuthFlow.DECAP and any(value is None for value in context):
-            raise ValueError("This OAuth state requires a bound origin and repository context.")
-        if self.flow is OAuthFlow.SETUP and (self.origin is None or self.installation_id is None):
-            raise ValueError("Setup OAuth state requires an origin and installation context.")
+        if self.flow is OAuthFlow.DECAP and (
+            self.origin is None or self.repository_id is None or self.installation_id is not None
+        ):
+            raise ValueError("Decap OAuth state requires an origin and repository ID.")
         if self.flow is OAuthFlow.CMS_ENABLEMENT_DISCOVERY and (
             self.origin is not None
-            or self.target_origin is not None
             or self.repository_id is not None
             or self.installation_id is not None
             or self.base_commit_sha is not None
@@ -68,7 +65,6 @@ class OAuthState(BaseModel):
             self.origin is not None
             or self.repository_id is not None
             or self.installation_id is None
-            or self.target_origin is not None
             or self.target_branch is not None
         ):
             raise ValueError("CMS installation state requires only an installation context.")
@@ -76,7 +72,6 @@ class OAuthState(BaseModel):
             self.origin is not None
             or self.repository_id is None
             or self.installation_id is None
-            or self.target_origin is not None
             or self.target_branch is not None
         ):
             raise ValueError("CMS repository state requires repository and installation contexts.")
@@ -84,7 +79,6 @@ class OAuthState(BaseModel):
             self.origin is not None
             or self.repository_id is None
             or self.installation_id is None
-            or self.target_origin is not None
             or self.target_branch is None
         ):
             raise ValueError(
@@ -94,7 +88,6 @@ class OAuthState(BaseModel):
             self.origin is not None
             or self.repository_id is None
             or self.installation_id is None
-            or self.target_origin is not None
             or self.target_branch is None
             or self.base_commit_sha is None
             or self.engine_selector is None
@@ -104,19 +97,6 @@ class OAuthState(BaseModel):
             raise ValueError(
                 "CMS confirmation state requires the reviewed repository and plan identity."
             )
-        if self.flow is OAuthFlow.ENROLLMENT and (
-            self.origin is None
-            or self.target_origin is not None
-            or self.repository_id is not None
-            or self.installation_id is not None
-        ):
-            raise ValueError("Enrollment OAuth state requires only an origin.")
-        if self.flow is OAuthFlow.ORIGIN_MIGRATION and (
-            any(value is None for value in context) or self.target_origin is None
-        ):
-            raise ValueError("Origin-migration OAuth state requires source and target contexts.")
-        if self.flow in (OAuthFlow.DECAP, OAuthFlow.SETUP) and self.target_origin is not None:
-            raise ValueError("Only origin-migration state may contain a target origin.")
         if (
             self.flow
             not in (
@@ -131,6 +111,21 @@ class OAuthState(BaseModel):
             and self.reviewed_plan_digest is not None
         ):
             raise ValueError("Only CMS confirmation state may contain a reviewed plan.")
+        if self.approved_origins is not None and self.flow not in (
+            OAuthFlow.CMS_ENABLEMENT_BRANCH,
+            OAuthFlow.CMS_ENABLEMENT_CONFIRMATION,
+        ):
+            raise ValueError("Only branch-bound CMS state may contain approved origins.")
+        if (self.default_branch_commit_sha is None) != (self.reviewed_policy_digest is None):
+            raise ValueError("CMS policy review requires both its branch and content revision.")
+        if self.reviewed_policy_digest is not None and (
+            self.flow is not OAuthFlow.CMS_ENABLEMENT_CONFIRMATION or self.approved_origins is None
+        ):
+            raise ValueError("Only a confirmed CMS policy review may carry its digest.")
+        if self.approved_origins is not None and (
+            not self.approved_origins or sum(len(origin) for origin in self.approved_origins) > 4096
+        ):
+            raise ValueError("CMS approved origins exceed the signed-state bound.")
         return self
 
 
@@ -183,27 +178,9 @@ class OAuthStateManager:
         self,
         origin: str,
         repository_id: int,
-        installation_id: int,
     ) -> IssuedOAuthState:
-        """Create Decap state that binds the callback to an already-resolved site and repository."""
-        return self._issue_with_context(OAuthFlow.DECAP, origin, repository_id, installation_id)
-
-    def issue_enrollment(self, origin: str) -> IssuedOAuthState:
-        """Create initial enrollment state bound only to the popup's captured CMS origin."""
-        return self._issue_with_context(OAuthFlow.ENROLLMENT, origin)
-
-    def issue_setup(
-        self,
-        origin: str,
-        repository_id: int,
-        installation_id: int,
-    ) -> IssuedOAuthState:
-        """Create fresh confirmation state for the selected App installation and repository."""
-        return self._issue_with_context(OAuthFlow.SETUP, origin, repository_id, installation_id)
-
-    def issue_setup_installation(self, origin: str, installation_id: int) -> IssuedOAuthState:
-        """Create setup state for an untrusted App installation pending fresh user verification."""
-        return self._issue_with_context(OAuthFlow.SETUP, origin, installation_id=installation_id)
+        """Bind the actual opener origin and requested repository across GitHub OAuth."""
+        return self._issue_with_context(OAuthFlow.DECAP, origin, repository_id)
 
     def issue_cms_enablement_installation(self, installation_id: int) -> IssuedOAuthState:
         """Bind direct App-install setup to an installation before repository selection."""
@@ -233,6 +210,9 @@ class OAuthStateManager:
         engine_commit_sha: str,
         reviewed_plan_digest: str,
         correlation_nonce: str | None = None,
+        approved_origins: tuple[str, ...] | None = None,
+        default_branch_commit_sha: str | None = None,
+        reviewed_policy_digest: str | None = None,
     ) -> IssuedOAuthState:
         """Bind confirmation to the exact reviewed target revision and engine source revision."""
         return self._issue_without_origin(
@@ -244,6 +224,9 @@ class OAuthStateManager:
             engine_selector=engine_selector,
             engine_commit_sha=engine_commit_sha,
             reviewed_plan_digest=reviewed_plan_digest,
+            approved_origins=approved_origins,
+            default_branch_commit_sha=default_branch_commit_sha,
+            reviewed_policy_digest=reviewed_policy_digest,
             correlation_nonce=correlation_nonce,
         )
 
@@ -253,6 +236,7 @@ class OAuthStateManager:
         installation_id: int,
         target_branch: str,
         correlation_nonce: str | None = None,
+        approved_origins: tuple[str, ...] | None = None,
     ) -> IssuedOAuthState:
         """Bind CMS migration planning to the creator-selected branch."""
         return self._issue_without_origin(
@@ -260,23 +244,8 @@ class OAuthStateManager:
             installation_id,
             repository_id,
             target_branch=target_branch,
+            approved_origins=approved_origins,
             correlation_nonce=correlation_nonce,
-        )
-
-    def issue_origin_migration(
-        self,
-        source_origin: str,
-        target_origin: str,
-        repository_id: int,
-        installation_id: int,
-    ) -> IssuedOAuthState:
-        """Bind a fresh owner authorization to one source origin and one pending destination."""
-        return self._issue_with_context(
-            OAuthFlow.ORIGIN_MIGRATION,
-            source_origin,
-            repository_id,
-            installation_id,
-            target_origin,
         )
 
     def attach_correlation_cookie(self, response: Response, issued_state: IssuedOAuthState) -> None:
@@ -348,7 +317,6 @@ class OAuthStateManager:
         origin: str,
         repository_id: int | None = None,
         installation_id: int | None = None,
-        target_origin: str | None = None,
     ) -> IssuedOAuthState:
         """Sign state and attach a flow-specific nonce cookie for a validated callback context."""
         correlation_nonce = secrets.token_urlsafe(32)
@@ -358,7 +326,6 @@ class OAuthStateManager:
             origin=origin,
             repository_id=repository_id,
             installation_id=installation_id,
-            target_origin=target_origin,
         )
         token = self._serializer(flow).dumps(state.model_dump(mode="json"))
         return IssuedOAuthState(
@@ -377,6 +344,9 @@ class OAuthStateManager:
         engine_selector: str | None = None,
         engine_commit_sha: str | None = None,
         reviewed_plan_digest: str | None = None,
+        approved_origins: tuple[str, ...] | None = None,
+        default_branch_commit_sha: str | None = None,
+        reviewed_policy_digest: str | None = None,
         correlation_nonce: str | None = None,
     ) -> IssuedOAuthState:
         """Sign a direct GitHub App setup flow that deliberately has no CMS browser origin."""
@@ -391,6 +361,9 @@ class OAuthStateManager:
             engine_selector=engine_selector,
             engine_commit_sha=engine_commit_sha,
             reviewed_plan_digest=reviewed_plan_digest,
+            approved_origins=approved_origins,
+            default_branch_commit_sha=default_branch_commit_sha,
+            reviewed_policy_digest=reviewed_policy_digest,
         )
         token = self._serializer(flow).dumps(state.model_dump(mode="json"))
         return IssuedOAuthState(

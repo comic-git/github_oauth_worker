@@ -4,9 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from github_oauth_worker.config import (
-    AccessPolicyMode,
     ConfigurationError,
-    Environment,
     ServiceMode,
     WorkerSettings,
     load_settings,
@@ -17,7 +15,6 @@ def test_bootstrap_settings_need_no_runtime_credentials() -> None:
     settings = WorkerSettings()
 
     assert settings.service_mode is ServiceMode.BOOTSTRAP
-    assert settings.firestore_database_id == "test"
     assert settings.github_login_whitelist == frozenset()
 
 
@@ -63,20 +60,6 @@ def test_ready_mode_requires_all_sensitive_runtime_values() -> None:
         WorkerSettings(service_mode=ServiceMode.READY)
 
 
-def test_ready_mode_rejects_database_from_another_environment() -> None:
-    with pytest.raises(ValidationError, match="must use Firestore database"):
-        WorkerSettings(
-            service_mode=ServiceMode.READY,
-            environment=Environment.PRODUCTION,
-            gcp_project_id="example-project",
-            firestore_database_id="test",
-            public_base_url="https://worker.example.com",
-            github_app_client_id="client-id",
-            github_app_client_secret="client-secret",
-            state_signing_secret="state-secret",
-        )
-
-
 def test_ready_mode_rejects_a_non_https_callback_url() -> None:
     with pytest.raises(ValidationError, match="HTTPS origin"):
         WorkerSettings(
@@ -87,21 +70,6 @@ def test_ready_mode_rejects_a_non_https_callback_url() -> None:
             github_app_client_secret="client-secret",
             state_signing_secret="state-secret",
         )
-
-
-def test_ready_mode_exposes_only_validated_firestore_identifiers() -> None:
-    settings = WorkerSettings(
-        service_mode=ServiceMode.READY,
-        gcp_project_id="example-project",
-        public_base_url="https://worker.example.com",
-        github_app_client_id="client-id",
-        github_app_client_secret="client-secret",
-        state_signing_secret="state-secret",
-        access_policy=AccessPolicyMode.PUBLIC,
-    )
-
-    assert settings.firestore.project_id == "example-project"
-    assert settings.firestore.database_id == "test"
 
 
 @pytest.mark.parametrize("ttl_seconds", [59, 3_601])

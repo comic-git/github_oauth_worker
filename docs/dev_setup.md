@@ -5,7 +5,7 @@
 
 ## Current State
 
-The package, local venv workflow, bootstrap health endpoint, configuration validation, signed OAuth-state utilities, and GitHub-login access-policy boundary are implemented. OAuth, binding, and GitHub API routes are still in development, so local startup intentionally remains in bootstrap mode unless ready-mode configuration is supplied.
+The package, local venv workflow, GitHub App OAuth routes, CMS setup, and repository access-policy checks are implemented. Local startup remains in bootstrap mode unless ready-mode configuration is supplied.
 
 ```powershell
 py -3.14 -m venv .venv
@@ -19,14 +19,14 @@ py -3.14 -m venv .venv
 
 - The latest stable Python version supported by Cloud Run, CI, and dependencies; currently Python 3.14.
 - A local Python venv for all normal development, static checks, and offline tests.
-- A dedicated sandbox GitHub App and public HTTPS test worker only for real browser authorization/enrollment tests.
+- A dedicated sandbox GitHub App and public HTTPS test worker only for real browser authorization and setup tests.
 - Google Cloud CLI and Pulumi only when provisioning or inspecting cloud infrastructure.
 
 Docker is not required for normal local development. The deployment path may use Cloud Run source builds or a CI-built container image, but the local venv is the authoritative fast-feedback environment.
 
 ## Environment Separation
 
-The test and production workers have different public URLs, GitHub Apps, client credentials, service accounts, and Firestore database IDs. A comic_git CMS configuration selects the environment by using that worker's URL. Enrollment never asks a user to choose test or production.
+The test and production workers have different public URLs, GitHub Apps, client credentials, and service accounts. A comic_git CMS configuration selects the environment by using that worker's URL. Setup never asks a user to choose test or production.
 
 ## Credentials
 

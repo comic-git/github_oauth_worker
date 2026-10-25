@@ -1,6 +1,6 @@
 # CMS Setup Manual Verification
 
-Use this checklist against a deployed test worker and test GitHub App. The IDs and step numbers are references for reporting a failure (for example, "B, step 5"). A-E cover the ordinary setup paths; F-N need specific accounts, repository states, or browser changes and can be run separately. The expected worker page headings are literal; GitHub controls its own page wording and may omit an account chooser or return immediately when the browser is already authorized. **Continue with GitHub** always redirects through GitHub authorization, even if the App is already installed for the repository. An unexpected extra GitHub authorization *after repository selection* is a failure only in a case that explicitly expects direct branch selection.
+Use this checklist against a deployed test worker and test GitHub App. **B is the recommended first-time creator path:** start at `/setup`, then follow the worker's link to install the App. D verifies the supported alternate path that starts on GitHub. The IDs and step numbers are references for reporting a failure (for example, "B, step 5"). A-E cover the ordinary setup paths; F-N need specific accounts, repository states, or browser changes and can be run separately. The expected worker page headings are literal; GitHub controls its own page wording and may omit an account chooser or return immediately when the browser is already authorized. **Continue with GitHub** always redirects through GitHub authorization, even if the App is already installed for the repository. An unexpected extra GitHub authorization *after repository selection* is a failure only in a case that explicitly expects direct branch selection.
 
 ## Preparation
 
@@ -101,8 +101,8 @@ Use this checklist against a deployed test worker and test GitHub App. The IDs a
 | Step | Action | Expected result |
 |------|--------|-----------------|
 | 1 | Select a branch whose engine version is older than the worker's CMS minimum. | After branch selection, the worker reports that the engine version is too old, with troubleshooting code `engine_version_too_old`; no PR is created. |
-| 2 | Separately, select a branch already migrated to TOML and enabled for this repository, branch, and worker. It may retain legacy INI files. | Worker: **comic_git CMS is already enabled**, with a message that no migration pull request is needed. No new PR is created. |
-| 3 | Select a TOML-backed branch whose CMS is disabled, or whose enabled CMS settings point to another repository, branch, or worker. | Worker shows `cms_toml_not_enabled` or `cms_settings_mismatch`, respectively. Neither state is treated as an already-enabled success. |
+| 2 | Separately, select a branch already migrated to TOML and enabled for this repository, branch, and worker. It may retain legacy INI files. | Worker: **comic_git CMS is already enabled**, with a message that no migration pull request is needed. The setup flow still offers an access-policy pull request if the current default branch does not authorize this website. |
+| 3 | Select a TOML-backed branch whose CMS is disabled, or whose enabled CMS settings point to another repository, branch, or worker. | Worker reviews a narrow repair to worker-owned `[cms]` settings, preserving other TOML content and comments. Confirming the review creates or refreshes the migration pull request. |
 | 4 | Select a TOML-backed branch with matching CMS settings but a page that fails the engine's CMS editing checks. | Worker shows `cms_not_ready` and does not create a PR. The engine build provides the file-level readiness details. |
 
 ## Pull Request Lifecycle

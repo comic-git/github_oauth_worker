@@ -7,7 +7,9 @@ This repository will provide the OAuth bridge for the Decap CMS integration in c
 
 ## Quick Start
 
-The local bootstrap service exposes a health endpoint only. Configuration, signed state, and access-policy foundations are implemented, but OAuth routes remain unavailable until the binding and GitHub-client tasks are complete.
+The worker serves GitHub App OAuth for Decap and guides repository owners through CMS setup. Website authorization is defined by `.comic_git/cms_access.toml` on the repository's current default branch; the worker has no runtime database dependency. Start with the [infrastructure setup guide](infra/README.md) when deploying a worker.
+
+Creators should start at the deployed worker's `/setup` URL before installing its GitHub App. The worker guides them to GitHub to grant repository access when needed, then returns them to branch selection and migration review. See [CMS enablement](docs/features/cms-oauth/cms-enablement.md) for the full flow. Installing the App directly first is also supported.
 
 ```powershell
 py -3.14 -m venv .venv
@@ -37,5 +39,6 @@ Before creating or deploying a hosted worker, follow the owner setup in [`infra/
 | [`docs/infrastructure.md`](docs/infrastructure.md)              | GCP, Pulumi, environments, and secrets     |
 | [`docs/contributing.md`](docs/contributing.md)                  | Branching, review, and AI workflow         |
 | [`docs/features/cms-oauth/`](docs/features/cms-oauth/README.md) | CMS OAuth requirements and Decap contract  |
+| [`docs/backlog.md`](docs/backlog.md)                            | Deferred work and pre-release checks       |
 
 See [`AGENTS.md`](AGENTS.md) for agent instructions and [`docs/contributing.md`](docs/contributing.md) for the development workflow.

@@ -1,5 +1,6 @@
 """Creator-facing pages for direct GitHub App CMS enablement setup."""
 
+from github_oauth_worker.cms_access import CmsAccessPolicyPlan
 from github_oauth_worker.cms_enablement import CmsMigrationPreview, MigrationFileChange
 from github_oauth_worker.github_client import (
     GitHubPullRequestDetails,
@@ -66,6 +67,25 @@ def render_cms_branch_selection_page(
     )
 
 
+def render_cms_access_origins_page(
+    state_token: str,
+    repository: GitHubRepository,
+    target_branch: str,
+    current_origins: tuple[str, ...],
+    worker_origin: str,
+) -> str:
+    """Ask the administrator to approve the complete website-origin list."""
+    return render_template(
+        "cms_setup_access_origins.tpl",
+        state_token=state_token,
+        repository=repository,
+        target_branch=target_branch,
+        current_origins=current_origins,
+        worker_origin=worker_origin,
+        default_branch=repository.default_branch,
+    )
+
+
 def render_cms_migration_summary_page(
     state_token: str,
     repository: GitHubRepository,
@@ -74,6 +94,8 @@ def render_cms_migration_summary_page(
     existing_pull_request_url: str | None = None,
     up_to_date: bool = False,
     superseded_pull_requests: tuple[GitHubPullRequestDetails, ...] = (),
+    access_policy_plan: CmsAccessPolicyPlan | None = None,
+    existing_policy_pull_request_url: str | None = None,
 ) -> str:
     """Render a content-free engine migration summary before the creator can request a write."""
     return render_template(
@@ -85,15 +107,23 @@ def render_cms_migration_summary_page(
         existing_pull_request_url=existing_pull_request_url,
         up_to_date=up_to_date,
         superseded_pull_requests=superseded_pull_requests,
+        access_policy_plan=access_policy_plan,
+        existing_policy_pull_request_url=existing_policy_pull_request_url,
     )
 
 
 def render_cms_migration_result_page(
-    pull_request_url: str, unremoved_branches: tuple[str, ...] = ()
+    pull_request_url: str | None,
+    unremoved_branches: tuple[str, ...] = (),
+    *,
+    access_policy_pull_request_url: str | None = None,
+    unremoved_policy_branches: tuple[str, ...] = (),
 ) -> str:
-    """Render the final non-secret link to the creator's migration pull request."""
+    """Render only the pull requests actually needed for the reviewed setup."""
     return render_template(
         "cms_setup_result.tpl",
         pull_request_url=pull_request_url,
         unremoved_branches=unremoved_branches,
+        access_policy_pull_request_url=access_policy_pull_request_url,
+        unremoved_policy_branches=unremoved_policy_branches,
     )

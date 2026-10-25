@@ -85,9 +85,12 @@ non-secret variable names, with values from its own bootstrap outputs:
 | `production` | `GCP_WIF_PROVIDER`    | `production_wif_provider`       |
 | `production` | `GCP_SERVICE_ACCOUNT` | `production_ci_service_account` |
 
-Configure the `production` environment to allow only `master` deployments and require reviewers
-before the future production apply job. Test does not require environment approval while the MVP
-deploys test changes from every branch.
+Configure the `production` environment to allow only `master` deployments. Configure required
+reviewers for both `test` and `production`: automatic workflow runs may reach the apply jobs, but
+neither job runs `pulumi up` before approval. Leave **Prevent self-review** off while one maintainer
+is the only available reviewer. Automatic preview jobs need separate, unprotected configuration
+and read-only identities; referencing either protected apply environment would also pause previews.
+Do not expose the existing deployment identities to pull-request code.
 
 Set these shared non-secret GitHub Actions repository variables:
 
@@ -103,11 +106,12 @@ belong in GitHub Environment secrets.
 
 ## Bootstrap Resources
 
-The owner-run bootstrap program creates the required APIs, protected KMS key, separate test and
-production Firestore databases, Artifact Registry repositories, Secret Manager containers, and
+The owner-run bootstrap program creates the required APIs, protected KMS key, Artifact Registry repositories, Secret Manager containers, and
 runtime/CI service accounts. It also creates separate GitHub Actions Workload Identity Federation
 pools and providers. The test provider permits this repository on any branch; the production
 provider additionally requires `master`.
+
+The worker and bootstrap program do not manage a database. Keep the shared Firestore API enabled in this GCP project; other services may rely on it.
 
 Each CI identity can deploy only its matching Cloud Run service, write only its matching Artifact
 Registry repository and Secret Manager versions, access only the shared Pulumi state bucket, and
