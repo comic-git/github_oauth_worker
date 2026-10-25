@@ -37,6 +37,7 @@ Before creating or deploying a hosted worker, follow the owner setup in [`infra/
 | [`docs/dev_setup.md`](docs/dev_setup.md)                        | Setup, dependencies, and local development |
 | [`docs/testing.md`](docs/testing.md)                            | Test strategy and conventions              |
 | [`docs/infrastructure.md`](docs/infrastructure.md)              | GCP, Pulumi, environments, and secrets     |
+| [`docs/cicd.md`](docs/cicd.md)                            | CI previews and approval-gated deployments |
 | [`docs/contributing.md`](docs/contributing.md)                  | Branching, review, and AI workflow         |
 | [`docs/features/cms-oauth/`](docs/features/cms-oauth/README.md) | CMS OAuth requirements and Decap contract  |
 | [`docs/backlog.md`](docs/backlog.md)                            | Deferred work and pre-release checks       |

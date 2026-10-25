@@ -122,17 +122,19 @@ class PulumiProgramTests(unittest.TestCase):
         self.assertIn("gcp:kms/cryptoKey:CryptoKey", mocks.resource_types)
         self.assertEqual(
             mocks.resource_types.count("gcp:kms/cryptoKeyIAMMember:CryptoKeyIAMMember"),
-            2,
+            4,
         )
         self.assertEqual(
             mocks.resource_types.count("gcp:storage/bucketIAMMember:BucketIAMMember"),
-            2,
+            6,
         )
         for resource_name in (
             "github-oauth-worker-test-runtime",
             "github-oauth-worker-test-ci",
+            "github-oauth-worker-test-preview",
             "github-oauth-worker-production-runtime",
             "github-oauth-worker-production-ci",
+            "github-oauth-worker-production-preview",
         ):
             account_id = mocks.resource_inputs[resource_name]["accountId"]
             self.assertLessEqual(len(str(account_id)), 30)
@@ -146,6 +148,24 @@ class PulumiProgramTests(unittest.TestCase):
             "gcp:iam/workloadIdentityPoolProvider:WorkloadIdentityPoolProvider",
             mocks.resource_types,
         )
+        for environment in ("test", "production"):
+            prefix = f"github-oauth-worker-{environment}"
+            lock_binding = mocks.resource_inputs[f"{prefix}-preview-pulumi-locks"]
+            self.assertEqual(lock_binding["role"], "roles/storage.objectAdmin")
+            self.assertIn("/.pulumi/locks/", lock_binding["condition"]["expression"])
+            self.assertEqual(
+                mocks.resource_inputs[f"{prefix}-preview-pulumi-secrets"]["role"],
+                "roles/cloudkms.cryptoKeyDecrypter",
+            )
+            provider = mocks.resource_inputs[f"{prefix}-provider"]
+            self.assertEqual(
+                provider["attributeMapping"]["attribute.environment"],
+                "assertion.environment",
+            )
+            deployment_member = str(mocks.resource_inputs[f"{prefix}-ci-workload-identity"])
+            preview_member = str(mocks.resource_inputs[f"{prefix}-preview-workload-identity"])
+            self.assertIn(f"/attribute.environment/{environment}", deployment_member)
+            self.assertIn(f"/attribute.environment/{environment}-preview", preview_member)
 
     def _run_program(
         self,
