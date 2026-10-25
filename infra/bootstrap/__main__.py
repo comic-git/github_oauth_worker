@@ -81,6 +81,7 @@ def create_environment(
     environment: str,
     service_dependencies: list[gcp.projects.Service],
     cloud_run_service_agent: pulumi.Output[str],
+    cloud_run_operation_reader_role: pulumi.Input[str],
     pulumi_secrets_key: pulumi.Input[str],
     pulumi_state_bucket: str,
 ) -> dict[str, pulumi.Input[str]]:
@@ -101,6 +102,20 @@ def create_environment(
         display_name=f"GitHub OAuth worker {environment} deployment CI",
         opts=pulumi.ResourceOptions(depends_on=service_dependencies),
     )
+    # Cloud Run operations are regional resources, not children of a service.
+    gcp.projects.IAMMember(
+        f"{resource_prefix}-ci-cloud-run-operations",
+        project=project_id,
+        role=cloud_run_operation_reader_role,
+        member=ci_service_account.member,
+    )
+    preview_service_account = gcp.serviceaccount.Account(
+        f"{resource_prefix}-preview",
+        project=project_id,
+        account_id=service_account_id(environment, "preview"),
+        display_name=f"GitHub OAuth worker {environment} preview CI",
+        opts=pulumi.ResourceOptions(depends_on=service_dependencies),
+    )
     # CI writes and reads Pulumi secret configuration. Runtime only reads the
     # resulting Secret Manager values, so it receives no Cloud KMS permission.
     gcp.kms.CryptoKeyIAMMember(
@@ -109,6 +124,12 @@ def create_environment(
         role="roles/cloudkms.cryptoKeyEncrypterDecrypter",
         member=ci_service_account.member,
     )
+    gcp.kms.CryptoKeyIAMMember(
+        f"{resource_prefix}-preview-pulumi-secrets",
+        crypto_key_id=pulumi_secrets_key,
+        role="roles/cloudkms.cryptoKeyDecrypter",
+        member=preview_service_account.member,
+    )
     # Pulumi's GCS backend stores state as objects; CI has no access outside
     # this manually created bucket.
     gcp.storage.BucketIAMMember(
@@ -116,6 +137,33 @@ def create_environment(
         bucket=pulumi_state_bucket,
         role="roles/storage.objectAdmin",
         member=ci_service_account.member,
+    )
+    gcp.storage.BucketIAMMember(
+        f"{resource_prefix}-preview-pulumi-state-reader",
+        bucket=pulumi_state_bucket,
+        role="roles/storage.objectViewer",
+        member=preview_service_account.member,
+    )
+    # A DIY Pulumi preview needs to create and release its lock, but must not
+    # gain write access to stack checkpoints or history.
+    gcp.storage.BucketIAMMember(
+        f"{resource_prefix}-preview-pulumi-locks",
+        bucket=pulumi_state_bucket,
+        role="roles/storage.objectAdmin",
+        member=preview_service_account.member,
+        condition=gcp.storage.BucketIAMMemberConditionArgs(
+            title=f"{resource_prefix}-preview-locks-only",
+            expression=(
+                "resource.name.startsWith("
+                f"'projects/_/buckets/{pulumi_state_bucket}/objects/.pulumi/locks/')"
+            ),
+        ),
+    )
+    gcp.projects.IAMMember(
+        f"{resource_prefix}-preview-project-reader",
+        project=project_id,
+        role="roles/viewer",
+        member=preview_service_account.member,
     )
 
     artifact_repository = gcp.artifactregistry.Repository(
@@ -202,22 +250,31 @@ def create_environment(
             "google.subject": "assertion.sub",
             "attribute.repository": "assertion.repository",
             "attribute.ref": "assertion.ref",
+            "attribute.environment": "assertion.environment",
         },
         oidc=gcp.iam.WorkloadIdentityPoolProviderOidcArgs(issuer_uri=GITHUB_OIDC_ISSUER),
     )
     workload_identity_inputs = pulumi.Output.all(project_number, pool.workload_identity_pool_id)
-    workload_identity_principal = workload_identity_inputs.apply(
-        lambda values: (
-            "principalSet://iam.googleapis.com/"
-            f"projects/{values[0]}/locations/global/workloadIdentityPools/{values[1]}"
-            f"/attribute.repository/{repository}"
+    def environment_principal(name: str) -> pulumi.Output[str]:
+        return workload_identity_inputs.apply(
+            lambda values: (
+                "principalSet://iam.googleapis.com/"
+                f"projects/{values[0]}/locations/global/workloadIdentityPools/{values[1]}"
+                f"/attribute.environment/{name}"
+            )
         )
-    )
+
     gcp.serviceaccount.IAMMember(
         f"{resource_prefix}-ci-workload-identity",
         service_account_id=ci_service_account.name,
         role="roles/iam.workloadIdentityUser",
-        member=workload_identity_principal,
+        member=environment_principal(environment),
+    )
+    gcp.serviceaccount.IAMMember(
+        f"{resource_prefix}-preview-workload-identity",
+        service_account_id=preview_service_account.name,
+        role="roles/iam.workloadIdentityUser",
+        member=environment_principal(f"{environment}-preview"),
     )
     gcp.serviceaccount.IAMMember(
         f"{resource_prefix}-ci-act-as-runtime",
@@ -225,24 +282,10 @@ def create_environment(
         role="roles/iam.serviceAccountUser",
         member=ci_service_account.member,
     )
-    gcp.projects.IAMMember(
-        f"{resource_prefix}-ci-cloud-run-admin",
-        project=project_id,
-        role="roles/run.admin",
-        member=ci_service_account.member,
-        condition=gcp.projects.IAMMemberConditionArgs(
-            title=f"{resource_prefix}-cloud-run-only",
-            description="Restrict CI to its one Cloud Run service.",
-            expression=(
-                "resource.name == "
-                f"'projects/{project_id}/locations/{REGION}/services/{resource_prefix}'"
-            ),
-        ),
-    )
-
     return {
         "artifact_repository": artifact_repository.repository_id,
         "ci_service_account": ci_service_account.email,
+        "preview_service_account": preview_service_account.email,
         "runtime_service_account": runtime_service_account.email,
         "wif_provider": provider.name,
     }
@@ -260,6 +303,17 @@ if config.get("region") not in (None, REGION):
 
 project = gcp.organizations.get_project_output(project_id=project_id)
 services = create_project_services(project_id)
+cloud_run_operation_reader = gcp.projects.IAMCustomRole(
+    "cloud-run-operation-reader",
+    project=project_id,
+    role_id="ghOauthWorkerOperationReader",
+    title="GitHub OAuth worker Cloud Run operation reader",
+    description=(
+        "Lets deployment CI poll Cloud Run service updates without project-wide service access."
+    ),
+    permissions=["run.operations.get"],
+    opts=pulumi.ResourceOptions(depends_on=services),
+)
 cloud_run_identity = gcp.projects.ServiceIdentity(
     "cloud-run-service-agent",
     project=project_id,
@@ -296,6 +350,7 @@ test = create_environment(
     environment="test",
     service_dependencies=services,
     cloud_run_service_agent=cloud_run_identity.email,
+    cloud_run_operation_reader_role=cloud_run_operation_reader.name,
     pulumi_secrets_key=pulumi_secrets_key.id,
     pulumi_state_bucket=pulumi_state_bucket,
 )
@@ -306,6 +361,7 @@ production = create_environment(
     environment="production",
     service_dependencies=services,
     cloud_run_service_agent=cloud_run_identity.email,
+    cloud_run_operation_reader_role=cloud_run_operation_reader.name,
     pulumi_secrets_key=pulumi_secrets_key.id,
     pulumi_state_bucket=pulumi_state_bucket,
 )

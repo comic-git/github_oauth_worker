@@ -75,30 +75,46 @@ GitHub App, expose the worker publicly, or configure optional billing alerts.
 
 ## GitHub Actions Configuration
 
-Create GitHub Environments named `test` and `production`. Each environment holds the same
+After reviewing and applying the updated bootstrap stack, complete the one-time owner-run deployment of each normal stack described below. That creates its Cloud Run service and grants its matching CI identity Admin access on that service only. CI cannot create a service before this grant exists. Then create four GitHub Environments.
+`test` and `production` are protected apply environments. `test-preview` and
+`production-preview` are unprotected so previews can run automatically. Each holds the same
 non-secret variable names, with values from its own bootstrap outputs:
 
-| Environment  | Variable              | Bootstrap output                |
-|--------------|-----------------------|---------------------------------|
-| `test`       | `GCP_WIF_PROVIDER`    | `test_wif_provider`             |
-| `test`       | `GCP_SERVICE_ACCOUNT` | `test_ci_service_account`       |
-| `production` | `GCP_WIF_PROVIDER`    | `production_wif_provider`       |
-| `production` | `GCP_SERVICE_ACCOUNT` | `production_ci_service_account` |
+| Environment          | Variable              | Bootstrap output                     |
+|----------------------|-----------------------|--------------------------------------|
+| `test`               | `GCP_WIF_PROVIDER`    | `test_wif_provider`                  |
+| `test`               | `GCP_SERVICE_ACCOUNT` | `test_ci_service_account`            |
+| `test-preview`       | `GCP_WIF_PROVIDER`    | `test_wif_provider`                  |
+| `test-preview`       | `GCP_SERVICE_ACCOUNT` | `test_preview_service_account`       |
+| `production`         | `GCP_WIF_PROVIDER`    | `production_wif_provider`            |
+| `production`         | `GCP_SERVICE_ACCOUNT` | `production_ci_service_account`      |
+| `production-preview` | `GCP_WIF_PROVIDER`    | `production_wif_provider`            |
+| `production-preview` | `GCP_SERVICE_ACCOUNT` | `production_preview_service_account` |
 
 Configure the `production` environment to allow only `master` deployments. Configure required
 reviewers for both `test` and `production`: automatic workflow runs may reach the apply jobs, but
 neither job runs `pulumi up` before approval. Leave **Prevent self-review** off while one maintainer
-is the only available reviewer. Automatic preview jobs need separate, unprotected configuration
-and read-only identities; referencing either protected apply environment would also pause previews.
-Do not expose the existing deployment identities to pull-request code.
+is the only available reviewer. Automatic preview jobs need separate, unprotected configuration;
+referencing either protected apply environment would also pause previews. The bootstrap stack binds
+each service account to its matching GitHub Environment claim. Do not expose deployment identities
+to pull-request code.
 
 Set these shared non-secret GitHub Actions repository variables:
 
-| Variable                  | Value                                       |
-|---------------------------|---------------------------------------------|
-| `GCP_PROJECT_ID`          | The GCP project ID in the bootstrap stack.  |
-| `PULUMI_BACKEND_URL`      | The `gs://<bucket-name>` state-backend URL. |
-| `PULUMI_SECRETS_PROVIDER` | `pulumi_secrets_provider_url` output.       |
+| Variable             | Value                                       |
+|----------------------|---------------------------------------------|
+| `GCP_PROJECT_ID`     | The GCP project ID in the bootstrap stack.  |
+| `PULUMI_BACKEND_URL` | The `gs://<bucket-name>` state-backend URL. |
+
+The stack YAML files already contain their KMS secrets-provider URL; the old
+`PULUMI_SECRETS_PROVIDER` repository variable is not used by this workflow.
+
+The `test` and `production` apply Environments must have required reviewers before enabling
+this workflow. Preview jobs start automatically and will fail until the bootstrap update and
+their Environment variables are in place. Confirm the first automatic previews succeed before
+approving either pending apply. The `test`
+Environment accepts trusted branches; restrict `production` to `master`. A stale branch head
+causes an approved apply job to fail rather than deploy old code.
 
 Do not put service-account keys, Pulumi access tokens, application secrets, or the temporary
 bootstrap passphrase in repository variables. Future environment-specific application secrets
@@ -106,17 +122,11 @@ belong in GitHub Environment secrets.
 
 ## Bootstrap Resources
 
-The owner-run bootstrap program creates the required APIs, protected KMS key, Artifact Registry repositories, Secret Manager containers, and
-runtime/CI service accounts. It also creates separate GitHub Actions Workload Identity Federation
-pools and providers. The test provider permits this repository on any branch; the production
-provider additionally requires `master`.
+The owner-run bootstrap program creates the required APIs, protected KMS key, Artifact Registry repositories, Secret Manager containers, and runtime/CI service accounts. It grants deployment CI accounts a project-level custom role containing only `run.operations.get`, which Pulumi needs to poll regional Cloud Run update operations. Service administration stays scoped to each environment's Cloud Run service. It also creates separate GitHub Actions Workload Identity Federation pools and providers. The test provider permits this repository on any branch; the production provider additionally requires `master`. Preview accounts can inspect project resources and decrypt Pulumi stack configuration, so only trusted same-repository branches and PRs run cloud previews. They may read state and write/delete only Pulumi lock objects in the state bucket; they cannot write stack checkpoints or change deployed resources. Fork PRs run offline tests only.
 
 The worker and bootstrap program do not manage a database. Keep the shared Firestore API enabled in this GCP project; other services may rely on it.
 
-Each CI identity can deploy only its matching Cloud Run service, write only its matching Artifact
-Registry repository and Secret Manager versions, access only the shared Pulumi state bucket, and
-encrypt/decrypt Pulumi secrets with the dedicated KMS key. The Cloud Run identities have no KMS
-permission and read application secrets only through Secret Manager.
+Each deployment CI identity can administer only its matching Cloud Run service, read regional Cloud Run operation status, write only its matching Artifact Registry repository and Secret Manager versions, access only the shared Pulumi state bucket, and encrypt/decrypt Pulumi secrets with the dedicated KMS key. The Cloud Run identities have no KMS permission and read application secrets only through Secret Manager.
 
 ## Normal Stacks
 
@@ -131,7 +141,7 @@ pulumi stack init test --secrets-provider=$kmsProvider
 pulumi stack init production --secrets-provider=$kmsProvider
 ```
 
-For later owner runs, select an existing normal stack instead of initializing it again. Apply the reviewed `serviceMode=bootstrap` preview to publish the worker image and deploy the service. The service URL produced by that deployment is then used during the matching GitHub App registration.
+For later owner runs, select an existing normal stack instead of initializing it again. An owner must apply the reviewed `serviceMode=bootstrap` preview once per environment to publish the worker image, create the service, and grant the matching CI identity service-level Cloud Run Admin access. That grant is part of the normal stack, not the bootstrap stack, because the service must exist first. The service URL produced by that deployment is then used during the matching GitHub App registration. Existing installations must also run one owner apply of each normal stack to establish this grant before CI can update the service. Do not approve a CI apply until that owner apply succeeds.
 
 After GitHub App registration, update the stack to `serviceMode=ready` with `publicBaseUrl`,
 `githubAppClientId`, and Pulumi secret values for the App client secret and state-signing secret.
@@ -140,7 +150,10 @@ Set the non-secret `githubAppSlug` to the slug in the App's GitHub public link t
 
 Both normal-stack files define the CMS engine-selector policy passed to their Cloud Run revision. `cmsMinimumEngineVersion` is the lowest released `X.Y` or `X.Y.Z` engine selector the worker will accept. `cmsAllowedEngineBranches` is the comma-separated list of moving official engine branches it will accept. Keep production limited to release-quality branches such as `latest,master`; test may include controlled development branches such as `cms`.
 
-Normal local development requires no GCP credentials. Any preview or apply requires an explicit human review. CI will later provide Docker and the same short-lived GCP identity used by Pulumi.
+Normal local development requires no GCP credentials. CI previews run automatically;
+apply jobs wait for GitHub Environment reviewer approval. Local Pulumi applies still require
+explicit human approval. GitHub-hosted apply runners provide Docker and use the short-lived
+deployment identity for the matching environment.
 
 ## Optional Cost Controls
 

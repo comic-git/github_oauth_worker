@@ -36,6 +36,15 @@ class ResourceMocks(Mocks):
         self.resource_types.append(args.typ)
         outputs = dict(args.inputs)
         self.resource_inputs[args.name] = outputs
+        if args.typ == "gcp:serviceaccount/account:Account":
+            outputs.setdefault(
+                "email", f"{outputs['accountId']}@{outputs['project']}.iam.gserviceaccount.com"
+            )
+            outputs.setdefault("member", f"serviceAccount:{outputs['email']}")
+        if args.typ == "gcp:projects/iAMCustomRole:IAMCustomRole":
+            outputs.setdefault(
+                "name", f"projects/{outputs['project']}/roles/{outputs['roleId']}"
+            )
         outputs.setdefault("email", f"{args.name}@example.test")
         outputs.setdefault("name", args.name)
         outputs.setdefault(
@@ -73,6 +82,33 @@ class PulumiProgramTests(unittest.TestCase):
         self.assertFalse(image_inputs["buildOnPreview"])
         self.assertIn("gcp:cloudrunv2/service:Service", mocks.resource_types)
         self.assertIn("gcp:cloudrunv2/serviceIamMember:ServiceIamMember", mocks.resource_types)
+        deployment_grant = mocks.resource_inputs["github-oauth-worker-test-ci-admin"]
+        self.assertEqual(deployment_grant["role"], "roles/run.admin")
+        self.assertEqual(
+            deployment_grant["member"],
+            "serviceAccount:gh-oauth-worker-test-ci@comic-git.iam.gserviceaccount.com",
+        )
+        self.assertEqual(deployment_grant["name"], "github-oauth-worker-test")
+
+    def test_production_deployment_grant_is_scoped_to_its_service(self) -> None:
+        mocks = self._run_program(
+            program_path=INFRA_DIRECTORY / "__main__.py",
+            project_name="github-oauth-worker-infra",
+            stack_name="production",
+            configuration={
+                "github-oauth-worker-infra:environment": "production",
+                "gcp:project": "comic-git",
+                "github-oauth-worker-infra:cmsMinimumEngineVersion": "1.2",
+                "github-oauth-worker-infra:cmsAllowedEngineBranches": "latest,master",
+            },
+        )
+        deployment_grant = mocks.resource_inputs["github-oauth-worker-production-ci-admin"]
+        self.assertEqual(deployment_grant["role"], "roles/run.admin")
+        self.assertEqual(
+            deployment_grant["member"],
+            "serviceAccount:gh-oauth-worker-prod-ci@comic-git.iam.gserviceaccount.com",
+        )
+        self.assertEqual(deployment_grant["name"], "github-oauth-worker-production")
 
     def test_main_program_builds_a_ready_service_with_secret_versions(self) -> None:
         mocks = self._run_program(
@@ -120,19 +156,30 @@ class PulumiProgramTests(unittest.TestCase):
         self.assertNotIn("github-oauth-worker-production-runtime-firestore", mocks.resource_inputs)
         self.assertIn("gcp:kms/keyRing:KeyRing", mocks.resource_types)
         self.assertIn("gcp:kms/cryptoKey:CryptoKey", mocks.resource_types)
+        self.assertNotIn("github-oauth-worker-test-ci-cloud-run-admin", mocks.resource_inputs)
+        self.assertNotIn("github-oauth-worker-production-ci-cloud-run-admin", mocks.resource_inputs)
+        operation_role = mocks.resource_inputs["cloud-run-operation-reader"]
+        self.assertEqual(operation_role["roleId"], "ghOauthWorkerOperationReader")
+        self.assertEqual(operation_role["permissions"], ["run.operations.get"])
+        self.assertEqual(
+            mocks.resource_types.count("gcp:projects/iAMCustomRole:IAMCustomRole"),
+            1,
+        )
         self.assertEqual(
             mocks.resource_types.count("gcp:kms/cryptoKeyIAMMember:CryptoKeyIAMMember"),
-            2,
+            4,
         )
         self.assertEqual(
             mocks.resource_types.count("gcp:storage/bucketIAMMember:BucketIAMMember"),
-            2,
+            6,
         )
         for resource_name in (
             "github-oauth-worker-test-runtime",
             "github-oauth-worker-test-ci",
+            "github-oauth-worker-test-preview",
             "github-oauth-worker-production-runtime",
             "github-oauth-worker-production-ci",
+            "github-oauth-worker-production-preview",
         ):
             account_id = mocks.resource_inputs[resource_name]["accountId"]
             self.assertLessEqual(len(str(account_id)), 30)
@@ -146,6 +193,34 @@ class PulumiProgramTests(unittest.TestCase):
             "gcp:iam/workloadIdentityPoolProvider:WorkloadIdentityPoolProvider",
             mocks.resource_types,
         )
+        for environment in ("test", "production"):
+            prefix = f"github-oauth-worker-{environment}"
+            operation_binding = mocks.resource_inputs[f"{prefix}-ci-cloud-run-operations"]
+            self.assertEqual(
+                operation_binding["role"],
+                "projects/comic-git/roles/ghOauthWorkerOperationReader",
+            )
+            short_environment = "prod" if environment == "production" else environment
+            self.assertEqual(
+                operation_binding["member"],
+                f"serviceAccount:gh-oauth-worker-{short_environment}-ci@comic-git.iam.gserviceaccount.com",
+            )
+            lock_binding = mocks.resource_inputs[f"{prefix}-preview-pulumi-locks"]
+            self.assertEqual(lock_binding["role"], "roles/storage.objectAdmin")
+            self.assertIn("/.pulumi/locks/", lock_binding["condition"]["expression"])
+            self.assertEqual(
+                mocks.resource_inputs[f"{prefix}-preview-pulumi-secrets"]["role"],
+                "roles/cloudkms.cryptoKeyDecrypter",
+            )
+            provider = mocks.resource_inputs[f"{prefix}-provider"]
+            self.assertEqual(
+                provider["attributeMapping"]["attribute.environment"],
+                "assertion.environment",
+            )
+            deployment_member = str(mocks.resource_inputs[f"{prefix}-ci-workload-identity"])
+            preview_member = str(mocks.resource_inputs[f"{prefix}-preview-workload-identity"])
+            self.assertIn(f"/attribute.environment/{environment}", deployment_member)
+            self.assertIn(f"/attribute.environment/{environment}-preview", preview_member)
 
     def _run_program(
         self,
