@@ -57,3 +57,36 @@ def test_external_actions_are_pinned_to_commits() -> None:
             revision = action.rsplit("@", 1)[1]
             assert len(revision) == 40
             assert all(char in "0123456789abcdef" for char in revision)
+
+
+def test_pulumi_commands_have_separate_named_steps() -> None:
+    workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    for environment in ("test", "production"):
+        for job_name in (f"preview-{environment}", f"apply-{environment}"):
+            steps = workflow["jobs"][job_name]["steps"]
+            named_steps = {step["name"]: step for step in steps if "name" in step}
+            expected_names = [
+                "Install Pulumi dependencies",
+                "Log in to Pulumi backend",
+                f"Preview {environment} infrastructure",
+            ]
+            if job_name.startswith("apply-"):
+                expected_names.append(f"Apply {environment} infrastructure")
+            positions = [
+                next(index for index, step in enumerate(steps) if step.get("name") == name)
+                for name in expected_names
+            ]
+            assert positions == sorted(positions)
+            for name in expected_names:
+                assert named_steps[name]["working-directory"] == "infra"
+            assert "python -m venv .venv" in named_steps[expected_names[0]]["run"]
+            assert "pip install -r requirements.txt" in named_steps[expected_names[0]]["run"]
+            assert "pulumi " not in named_steps[expected_names[0]]["run"]
+            assert named_steps[expected_names[1]]["run"] == 'pulumi login "$PULUMI_BACKEND_URL"'
+            assert named_steps[expected_names[2]]["run"] == (
+                f"pulumi preview --stack {environment} --diff --non-interactive"
+            )
+            if job_name.startswith("apply-"):
+                assert named_steps[expected_names[3]]["run"] == (
+                    f"pulumi up --stack {environment} --yes --non-interactive"
+                )

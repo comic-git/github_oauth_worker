@@ -48,11 +48,16 @@ jobs:
       - uses: pulumi/actions@8e5e406f4007fca908480587cb9893c07090f58d # v7
         with:
           pulumi-version: 3.264.0
-      - run: |
+      - name: Install Pulumi dependencies
+        run: |
           python -m venv .venv
           .venv/bin/python -m pip install -r requirements.txt
-          pulumi login "$PULUMI_BACKEND_URL"
-          pulumi preview --stack test --diff --non-interactive
+        working-directory: infra
+      - name: Log in to Pulumi backend
+        run: pulumi login "$PULUMI_BACKEND_URL"
+        working-directory: infra
+      - name: Preview test infrastructure
+        run: pulumi preview --stack test --diff --non-interactive
         working-directory: infra
 
   preview-production:
@@ -81,11 +86,16 @@ jobs:
       - uses: pulumi/actions@8e5e406f4007fca908480587cb9893c07090f58d # v7
         with:
           pulumi-version: 3.264.0
-      - run: |
+      - name: Install Pulumi dependencies
+        run: |
           python -m venv .venv
           .venv/bin/python -m pip install -r requirements.txt
-          pulumi login "$PULUMI_BACKEND_URL"
-          pulumi preview --stack production --diff --non-interactive
+        working-directory: infra
+      - name: Log in to Pulumi backend
+        run: pulumi login "$PULUMI_BACKEND_URL"
+        working-directory: infra
+      - name: Preview production infrastructure
+        run: pulumi preview --stack production --diff --non-interactive
         working-directory: infra
 
   apply-test:
@@ -118,12 +128,19 @@ jobs:
       - uses: pulumi/actions@8e5e406f4007fca908480587cb9893c07090f58d # v7
         with:
           pulumi-version: 3.264.0
-      - run: |
+      - name: Install Pulumi dependencies
+        run: |
           python -m venv .venv
           .venv/bin/python -m pip install -r requirements.txt
-          pulumi login "$PULUMI_BACKEND_URL"
-          pulumi preview --stack test --diff --non-interactive
-          pulumi up --stack test --yes --non-interactive
+        working-directory: infra
+      - name: Log in to Pulumi backend
+        run: pulumi login "$PULUMI_BACKEND_URL"
+        working-directory: infra
+      - name: Preview test infrastructure
+        run: pulumi preview --stack test --diff --non-interactive
+        working-directory: infra
+      - name: Apply test infrastructure
+        run: pulumi up --stack test --yes --non-interactive
         working-directory: infra
 
   apply-production:
@@ -156,10 +173,17 @@ jobs:
       - uses: pulumi/actions@8e5e406f4007fca908480587cb9893c07090f58d # v7
         with:
           pulumi-version: 3.264.0
-      - run: |
+      - name: Install Pulumi dependencies
+        run: |
           python -m venv .venv
           .venv/bin/python -m pip install -r requirements.txt
-          pulumi login "$PULUMI_BACKEND_URL"
-          pulumi preview --stack production --diff --non-interactive
-          pulumi up --stack production --yes --non-interactive
+        working-directory: infra
+      - name: Log in to Pulumi backend
+        run: pulumi login "$PULUMI_BACKEND_URL"
+        working-directory: infra
+      - name: Preview production infrastructure
+        run: pulumi preview --stack production --diff --non-interactive
+        working-directory: infra
+      - name: Apply production infrastructure
+        run: pulumi up --stack production --yes --non-interactive
         working-directory: infra
