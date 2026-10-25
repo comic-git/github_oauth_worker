@@ -81,6 +81,7 @@ def create_environment(
     environment: str,
     service_dependencies: list[gcp.projects.Service],
     cloud_run_service_agent: pulumi.Output[str],
+    cloud_run_operation_reader_role: pulumi.Input[str],
     pulumi_secrets_key: pulumi.Input[str],
     pulumi_state_bucket: str,
 ) -> dict[str, pulumi.Input[str]]:
@@ -100,6 +101,13 @@ def create_environment(
         account_id=service_account_id(environment, "ci"),
         display_name=f"GitHub OAuth worker {environment} deployment CI",
         opts=pulumi.ResourceOptions(depends_on=service_dependencies),
+    )
+    # Cloud Run operations are regional resources, not children of a service.
+    gcp.projects.IAMMember(
+        f"{resource_prefix}-ci-cloud-run-operations",
+        project=project_id,
+        role=cloud_run_operation_reader_role,
+        member=ci_service_account.member,
     )
     preview_service_account = gcp.serviceaccount.Account(
         f"{resource_prefix}-preview",
@@ -295,6 +303,17 @@ if config.get("region") not in (None, REGION):
 
 project = gcp.organizations.get_project_output(project_id=project_id)
 services = create_project_services(project_id)
+cloud_run_operation_reader = gcp.projects.IAMCustomRole(
+    "cloud-run-operation-reader",
+    project=project_id,
+    role_id="ghOauthWorkerOperationReader",
+    title="GitHub OAuth worker Cloud Run operation reader",
+    description=(
+        "Lets deployment CI poll Cloud Run service updates without project-wide service access."
+    ),
+    permissions=["run.operations.get"],
+    opts=pulumi.ResourceOptions(depends_on=services),
+)
 cloud_run_identity = gcp.projects.ServiceIdentity(
     "cloud-run-service-agent",
     project=project_id,
@@ -331,6 +350,7 @@ test = create_environment(
     environment="test",
     service_dependencies=services,
     cloud_run_service_agent=cloud_run_identity.email,
+    cloud_run_operation_reader_role=cloud_run_operation_reader.name,
     pulumi_secrets_key=pulumi_secrets_key.id,
     pulumi_state_bucket=pulumi_state_bucket,
 )
@@ -341,6 +361,7 @@ production = create_environment(
     environment="production",
     service_dependencies=services,
     cloud_run_service_agent=cloud_run_identity.email,
+    cloud_run_operation_reader_role=cloud_run_operation_reader.name,
     pulumi_secrets_key=pulumi_secrets_key.id,
     pulumi_state_bucket=pulumi_state_bucket,
 )

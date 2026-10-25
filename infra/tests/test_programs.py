@@ -36,6 +36,15 @@ class ResourceMocks(Mocks):
         self.resource_types.append(args.typ)
         outputs = dict(args.inputs)
         self.resource_inputs[args.name] = outputs
+        if args.typ == "gcp:serviceaccount/account:Account":
+            outputs.setdefault(
+                "email", f"{outputs['accountId']}@{outputs['project']}.iam.gserviceaccount.com"
+            )
+            outputs.setdefault("member", f"serviceAccount:{outputs['email']}")
+        if args.typ == "gcp:projects/iAMCustomRole:IAMCustomRole":
+            outputs.setdefault(
+                "name", f"projects/{outputs['project']}/roles/{outputs['roleId']}"
+            )
         outputs.setdefault("email", f"{args.name}@example.test")
         outputs.setdefault("name", args.name)
         outputs.setdefault(
@@ -149,6 +158,13 @@ class PulumiProgramTests(unittest.TestCase):
         self.assertIn("gcp:kms/cryptoKey:CryptoKey", mocks.resource_types)
         self.assertNotIn("github-oauth-worker-test-ci-cloud-run-admin", mocks.resource_inputs)
         self.assertNotIn("github-oauth-worker-production-ci-cloud-run-admin", mocks.resource_inputs)
+        operation_role = mocks.resource_inputs["cloud-run-operation-reader"]
+        self.assertEqual(operation_role["roleId"], "ghOauthWorkerOperationReader")
+        self.assertEqual(operation_role["permissions"], ["run.operations.get"])
+        self.assertEqual(
+            mocks.resource_types.count("gcp:projects/iAMCustomRole:IAMCustomRole"),
+            1,
+        )
         self.assertEqual(
             mocks.resource_types.count("gcp:kms/cryptoKeyIAMMember:CryptoKeyIAMMember"),
             4,
@@ -179,6 +195,16 @@ class PulumiProgramTests(unittest.TestCase):
         )
         for environment in ("test", "production"):
             prefix = f"github-oauth-worker-{environment}"
+            operation_binding = mocks.resource_inputs[f"{prefix}-ci-cloud-run-operations"]
+            self.assertEqual(
+                operation_binding["role"],
+                "projects/comic-git/roles/ghOauthWorkerOperationReader",
+            )
+            short_environment = "prod" if environment == "production" else environment
+            self.assertEqual(
+                operation_binding["member"],
+                f"serviceAccount:gh-oauth-worker-{short_environment}-ci@comic-git.iam.gserviceaccount.com",
+            )
             lock_binding = mocks.resource_inputs[f"{prefix}-preview-pulumi-locks"]
             self.assertEqual(lock_binding["role"], "roles/storage.objectAdmin")
             self.assertIn("/.pulumi/locks/", lock_binding["condition"]["expression"])
