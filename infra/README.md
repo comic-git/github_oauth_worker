@@ -85,10 +85,12 @@ non-secret variable names, with values from its own bootstrap outputs:
 | `production` | `GCP_WIF_PROVIDER`    | `production_wif_provider`       |
 | `production` | `GCP_SERVICE_ACCOUNT` | `production_ci_service_account` |
 
-Configure the `production` environment to allow only `master` deployments. Both test and production
-apply jobs require a deliberate manual workflow dispatch; neither starts on a push or pull request.
-Environment reviewers may provide an additional approval gate, but cannot replace the manual start.
-Test previews may run on trusted branches and pull requests without applying their changes.
+Configure the `production` environment to allow only `master` deployments. Configure required
+reviewers for both `test` and `production`: automatic workflow runs may reach the apply jobs, but
+neither job runs `pulumi up` before approval. Leave **Prevent self-review** off while one maintainer
+is the only available reviewer. Automatic preview jobs need separate, unprotected configuration
+and read-only identities; referencing either protected apply environment would also pause previews.
+Do not expose the existing deployment identities to pull-request code.
 
 Set these shared non-secret GitHub Actions repository variables:
 
