@@ -73,6 +73,33 @@ class PulumiProgramTests(unittest.TestCase):
         self.assertFalse(image_inputs["buildOnPreview"])
         self.assertIn("gcp:cloudrunv2/service:Service", mocks.resource_types)
         self.assertIn("gcp:cloudrunv2/serviceIamMember:ServiceIamMember", mocks.resource_types)
+        deployment_grant = mocks.resource_inputs["github-oauth-worker-test-ci-admin"]
+        self.assertEqual(deployment_grant["role"], "roles/run.admin")
+        self.assertEqual(
+            deployment_grant["member"],
+            "serviceAccount:gh-oauth-worker-test-ci@comic-git.iam.gserviceaccount.com",
+        )
+        self.assertEqual(deployment_grant["name"], "github-oauth-worker-test")
+
+    def test_production_deployment_grant_is_scoped_to_its_service(self) -> None:
+        mocks = self._run_program(
+            program_path=INFRA_DIRECTORY / "__main__.py",
+            project_name="github-oauth-worker-infra",
+            stack_name="production",
+            configuration={
+                "github-oauth-worker-infra:environment": "production",
+                "gcp:project": "comic-git",
+                "github-oauth-worker-infra:cmsMinimumEngineVersion": "1.2",
+                "github-oauth-worker-infra:cmsAllowedEngineBranches": "latest,master",
+            },
+        )
+        deployment_grant = mocks.resource_inputs["github-oauth-worker-production-ci-admin"]
+        self.assertEqual(deployment_grant["role"], "roles/run.admin")
+        self.assertEqual(
+            deployment_grant["member"],
+            "serviceAccount:gh-oauth-worker-prod-ci@comic-git.iam.gserviceaccount.com",
+        )
+        self.assertEqual(deployment_grant["name"], "github-oauth-worker-production")
 
     def test_main_program_builds_a_ready_service_with_secret_versions(self) -> None:
         mocks = self._run_program(
@@ -120,6 +147,8 @@ class PulumiProgramTests(unittest.TestCase):
         self.assertNotIn("github-oauth-worker-production-runtime-firestore", mocks.resource_inputs)
         self.assertIn("gcp:kms/keyRing:KeyRing", mocks.resource_types)
         self.assertIn("gcp:kms/cryptoKey:CryptoKey", mocks.resource_types)
+        self.assertNotIn("github-oauth-worker-test-ci-cloud-run-admin", mocks.resource_inputs)
+        self.assertNotIn("github-oauth-worker-production-ci-cloud-run-admin", mocks.resource_inputs)
         self.assertEqual(
             mocks.resource_types.count("gcp:kms/cryptoKeyIAMMember:CryptoKeyIAMMember"),
             4,

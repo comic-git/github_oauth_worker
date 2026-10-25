@@ -274,21 +274,6 @@ def create_environment(
         role="roles/iam.serviceAccountUser",
         member=ci_service_account.member,
     )
-    gcp.projects.IAMMember(
-        f"{resource_prefix}-ci-cloud-run-admin",
-        project=project_id,
-        role="roles/run.admin",
-        member=ci_service_account.member,
-        condition=gcp.projects.IAMMemberConditionArgs(
-            title=f"{resource_prefix}-cloud-run-only",
-            description="Restrict CI to its one Cloud Run service.",
-            expression=(
-                "resource.name == "
-                f"'projects/{project_id}/locations/{REGION}/services/{resource_prefix}'"
-            ),
-        ),
-    )
-
     return {
         "artifact_repository": artifact_repository.repository_id,
         "ci_service_account": ci_service_account.email,

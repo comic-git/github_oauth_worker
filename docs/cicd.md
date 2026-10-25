@@ -5,7 +5,7 @@
 
 ## Pipeline
 
-The workflow starts automatically. Infrastructure previews run without approval; apply jobs wait for a reviewer. Configure the owner-run bootstrap stack and all four GitHub Environments as described in [infrastructure setup](../infra/README.md#github-actions-configuration). Previews will fail until their identities and environment variables are available.
+The workflow starts automatically. Infrastructure previews run without approval; apply jobs wait for a reviewer. Configure the owner-run bootstrap stack, perform the initial owner apply of each normal stack, and configure all four GitHub Environments as described in [infrastructure setup](../infra/README.md#github-actions-configuration). Previews will fail until their identities and environment variables are available; applies cannot update Cloud Run until the normal stack has granted service-level access.
 
 1. `test` creates a venv, installs locked development dependencies, and runs formatting, static checks, and the offline test suite on commits and pull requests.
 2. `pulumi-preview-test` depends on `test` and automatically previews the test stack for trusted repository branches and pull requests.

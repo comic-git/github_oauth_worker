@@ -23,10 +23,10 @@ def secret_id(environment: str, name: str) -> str:
     return f"github-oauth-worker-{environment}-{name}"
 
 
-def runtime_service_account_id(environment: str) -> str:
-    """Match the bootstrap runtime account ID within GCP's 30-character limit."""
+def service_account_id(environment: str, role: str) -> str:
+    """Match bootstrap account IDs within GCP's 30-character limit."""
     environment_id = "prod" if environment == "production" else environment
-    return f"gh-oauth-worker-{environment_id}-runtime"
+    return f"gh-oauth-worker-{environment_id}-{role}"
 
 
 config = pulumi.Config()
@@ -46,8 +46,9 @@ if service_mode not in {"bootstrap", "ready"}:
     raise pulumi.RunError("serviceMode must be either 'bootstrap' or 'ready'.")
 
 runtime_service_account = (
-    f"{runtime_service_account_id(environment)}@{project_id}.iam.gserviceaccount.com"
+    f"{service_account_id(environment, 'runtime')}@{project_id}.iam.gserviceaccount.com"
 )
+ci_service_account = f"{service_account_id(environment, 'ci')}@{project_id}.iam.gserviceaccount.com"
 artifact_registry_host = f"{REGION}-docker.pkg.dev"
 image = docker.Image(
     f"github-oauth-worker-{environment}-image",
@@ -170,13 +171,22 @@ service = gcp.cloudrunv2.Service(
         ],
     ),
 )
-gcp.cloudrunv2.ServiceIamMember(
+public_invoker = gcp.cloudrunv2.ServiceIamMember(
     f"{service_name}-public-invoker",
     project=project_id,
     location=REGION,
     name=service.name,
     role="roles/run.invoker",
     member="allUsers",
+)
+gcp.cloudrunv2.ServiceIamMember(
+    f"{service_name}-ci-admin",
+    project=project_id,
+    location=REGION,
+    name=service.name,
+    role="roles/run.admin",
+    member=f"serviceAccount:{ci_service_account}",
+    opts=pulumi.ResourceOptions(depends_on=[public_invoker]),
 )
 
 pulumi.export("service_url", service.uri)

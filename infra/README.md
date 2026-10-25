@@ -75,7 +75,7 @@ GitHub App, expose the worker publicly, or configure optional billing alerts.
 
 ## GitHub Actions Configuration
 
-After reviewing and applying the updated bootstrap stack, create four GitHub Environments.
+After reviewing and applying the updated bootstrap stack, complete the one-time owner-run deployment of each normal stack described below. That creates its Cloud Run service and grants its matching CI identity Admin access on that service only. CI cannot create a service before this grant exists. Then create four GitHub Environments.
 `test` and `production` are protected apply environments. `test-preview` and
 `production-preview` are unprotected so previews can run automatically. Each holds the same
 non-secret variable names, with values from its own bootstrap outputs:
@@ -132,10 +132,7 @@ they cannot write stack checkpoints or change deployed resources. Fork PRs run o
 
 The worker and bootstrap program do not manage a database. Keep the shared Firestore API enabled in this GCP project; other services may rely on it.
 
-Each deployment CI identity can deploy only its matching Cloud Run service, write only its matching Artifact
-Registry repository and Secret Manager versions, access only the shared Pulumi state bucket, and
-encrypt/decrypt Pulumi secrets with the dedicated KMS key. The Cloud Run identities have no KMS
-permission and read application secrets only through Secret Manager.
+Each deployment CI identity can administer only its matching Cloud Run service, write only its matching Artifact Registry repository and Secret Manager versions, access only the shared Pulumi state bucket, and encrypt/decrypt Pulumi secrets with the dedicated KMS key. The Cloud Run identities have no KMS permission and read application secrets only through Secret Manager.
 
 ## Normal Stacks
 
@@ -150,7 +147,7 @@ pulumi stack init test --secrets-provider=$kmsProvider
 pulumi stack init production --secrets-provider=$kmsProvider
 ```
 
-For later owner runs, select an existing normal stack instead of initializing it again. Apply the reviewed `serviceMode=bootstrap` preview to publish the worker image and deploy the service. The service URL produced by that deployment is then used during the matching GitHub App registration.
+For later owner runs, select an existing normal stack instead of initializing it again. An owner must apply the reviewed `serviceMode=bootstrap` preview once per environment to publish the worker image, create the service, and grant the matching CI identity service-level Cloud Run Admin access. That grant is part of the normal stack, not the bootstrap stack, because the service must exist first. The service URL produced by that deployment is then used during the matching GitHub App registration. Existing installations must also run one owner apply of each normal stack to establish this grant before CI can update the service. Do not approve a CI apply until that owner apply succeeds.
 
 After GitHub App registration, update the stack to `serviceMode=ready` with `publicBaseUrl`,
 `githubAppClientId`, and Pulumi secret values for the App client secret and state-signing secret.
