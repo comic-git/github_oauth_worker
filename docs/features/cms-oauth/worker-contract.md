@@ -1,63 +1,29 @@
-<!-- ai-agent-toolkit:managed version="1.1.0" -->
-
 # CMS OAuth Worker Contract
 
-## Service Modes
+## Runtime Modes
 
-In `bootstrap` mode, the worker exposes health and setup guidance only. In `ready` mode, it requires valid App credentials and Firestore access before authorizing or enrolling users.
+`bootstrap` exposes health and setup guidance only. `ready` requires the GitHub App OAuth credentials, state-signing secret, public HTTPS worker origin, and environment policy. The runtime does not connect to Firestore.
 
-## Planned CMS Enablement
+## Decap Login
 
-After GitHub redirects a newly installed or updated App to `GET /setup`, the planned worker behavior presents a creator-facing CMS enablement flow rather than requiring a CMS popup opener. The setup `installation_id` is untrusted. The worker starts fresh GitHub user authorization, applies policy, verifies the user can administer the selected repository in that exact installation, previews an engine-produced migration summary, and requires an explicit confirmation before creating a migration pull request.
+A comic's CMS configuration sets `backend_auth_endpoint = "auth/<repository_id>"`, where the ID is GitHub's immutable numeric repository ID. Decap opens `GET /auth/<repository_id>` and refreshes at `POST /auth/<repository_id>/refresh?provider=github`. This selector is not proof of authorization.
 
-The worker reads the target's validated `engine.version` selector, resolves it once to an exact commit in the official comic_git_engine repository, and downloads that commit's supported migration runner into a temporary workspace containing only verified repository data fetched through GitHub's API. It never clones or executes target-repository code, reimplements TOML conversion, deletes legacy files, stores user tokens server-side, or exposes repository content in logs. The resulting branch changes only files in the validated engine-produced migration plan; it preserves the target's engine version, targets the repository's default branch, and creates a pull request. The branch and pull request record the resolved engine SHA. A later direct-commit delivery mode is intentionally out of scope.
+The login popup captures the opener's actual `MessageEvent.origin`. `POST /auth/<repository_id>/handshake` signs that origin and repository ID into short-lived OAuth state, protected by an HttpOnly correlation cookie, before redirecting to GitHub. The callback checks the signed state, exchanges the code for a user token, evaluates the GitHub-login policy, and verifies the user's App installation includes the selected repository.
 
-When both main configuration formats exist, the worker reads `comic_info.toml` as the engine does. The versioned runner may return an explicit `already_enabled` result with no files only after checking that the TOML CMS settings match the selected repository, branch, and worker and that all pages pass CMS readiness. The worker displays a no-op success and makes no Git write. Missing or mismatched CMS settings and readiness failures are fixed diagnostic categories, not implicit success. Older runners without this result continue using the migration-plan path.
+Before returning a token, the worker reads `.comic_git/cms_access.toml` through GitHub's Contents API on the repository's **current default branch**. It validates the file's schema, repository ID, worker origin, and approved browser origins. A missing, invalid, mismatched, or unreadable policy denies the token. The callback posts token data only to the signed exact origin. The worker never uses Decap's advisory `site_id` or a branch supplied by the website as authority.
 
-## Decap Authorization
+Refresh repeats the user policy, repository access, and live default-branch policy checks before releasing a new token. CORS preflight permits a syntactically valid HTTPS Origin so the browser can make the POST; preflight is not authorization. A denied POST returns no token and includes only a sanitized error and narrow CORS headers for that request origin. A removed policy or revoked GitHub access therefore blocks the next refresh, though previously issued GitHub tokens remain valid until GitHub expires or revokes them.
 
-`GET /auth`, `GET /callback`, and `POST /auth/refresh` implement Decap's GitHub authentication contract. The initial popup handshake captures the actual `MessageEvent.origin` of the CMS opener and submits it with a same-origin browser form so the GitHub authorization redirect navigates the popup rather than a `fetch()` request. The worker uses that origin to look up an active binding; it never treats Decap's `site_id` query parameter as proof of origin ownership.
+Two repositories can approve the same origin and remain separate by repository ID. This does not isolate JavaScript or browser storage between sites sharing one origin; users wanting that isolation need separate origins, such as custom domains.
 
-A successful callback sends `authorization:github:success:<json>` from the worker origin to the exact active CMS origin captured in signed state. Error callbacks use the same exact target. The worker must never use `postMessage(..., '*')` for a token-bearing result.
+## Guided Setup
 
-The worker exchanges a GitHub authorization code with the binding's repository ID, then verifies with GitHub's user installation/repository APIs that the returned token actually includes the repository. This verification is required because a requested repository ID may be ignored when it is unavailable. Refresh repeats that verification.
+`GET /setup` starts GitHub App discovery and repository/branch selection. The worker verifies the user has administrator authority before preparing changes. Setup always presents the current default-branch origins and proposed approval for explicit review. It signs the selected origins, default-branch revision, and generated plan digest; confirmation rechecks GitHub authorization and the reviewed revisions.
 
-Refresh resolves its binding from the browser request's exact `Origin` header, not Decap's advisory `site_id`. The worker returns CORS headers only for that active bound origin, then rechecks policy and repository access before returning refreshed credentials.
+The engine runner produces a versioned plan from the selected repository branch. A legacy INI site receives TOML files. An editable TOML site receives only needed repairs to worker-owned `[cms]` fields, preserving comments and unrelated settings. A site failing the engine's CMS editing checks is not automatically repaired. The worker creates or updates a CMS migration PR if files need to change, and a default-branch access-policy PR if the policy needs to change. When the target is the default branch, both changes can share one PR. The policy PR must merge before CMS login can succeed.
 
-## Self-Service Enrollment
+The setup session is short-lived, encrypted, bound to the selected installation and repository, and used only to reduce repeated GitHub account prompts. It stores no refresh token. The worker relies on GitHub branch/PR state rather than a second database for migration history.
 
-An unknown CMS origin may begin enrollment. The worker captures the actual origin, authenticates the prospective owner, evaluates policy, shows the canonical origin and selected repository for confirmation, and creates a binding only after verifying that the user's App installation includes that repository.
+## Operator Policy
 
-The initial enrollment token is used only to list verified installation/repository choices and is discarded before confirmation. Selecting a repository starts a fresh GitHub authorization; the worker verifies that second token against the selected installation and repository immediately before creating the binding and returning Decap credentials.
-
-The public GitHub App has a setup URL and redirects to it after installation changes. Setup `installation_id` values are untrusted input. The worker must verify the user can access both the installation and selected repository before creating a migration pull request or updating a binding.
-
-The guided `/setup` flow keeps its initial authorization in a short-lived, encrypted, authenticated, Secure, HttpOnly cookie scoped to `/setup` for repository discovery and for verifying a returned installation against GitHub. A creator may explicitly switch GitHub accounts. After repository selection, setup verifies the user's access and administrator authority, then replaces the discovery cookie with a session bound to the selected installation and repository IDs and the browser-correlated signed form state. It may retain the initial GitHub token, which can access other App-installed repositories; the session's repository binding is a worker-enforced limit, not a GitHub-enforced token restriction. If the discovery token is absent or cannot verify repository access, setup falls back to a new GitHub authorization with `repository_id` requested at token exchange. Neither cookie contains a refresh token or writes credentials to Firestore. Each cookie expires with OAuth state, and the repository session is cleared after successful confirmation. Repository membership, administrator authority, the target revision, and the reviewed migration plan are rechecked before writing; returning to a form never proves current access on its own.
-
-## Binding Lifecycle
-
-A binding is keyed by repository ID and contains active origin records, installation metadata, mutable owner/repository display metadata, status, and non-secret audit timestamps. One repository may have multiple active origins.
-
-Normal domain migration uses `GET /origins/migrate?target_origin=<https-origin>` from an
-existing active CMS site. Its popup captures the source site's actual browser origin, requires
-fresh GitHub authorization, and writes a short-lived pending target. The target site then opens
-`GET /origins/complete`; only a popup whose actual opener origin exactly matches that pending
-target can activate it. The source origin remains active until its configured grace period ends.
-The worker removes an expired source-origin index lazily when it is next looked up; it is already
-ineligible to authorize immediately at the grace-period boundary.
-
-An editor's failed repository-access check denies that editor's token but does not disable the shared binding: the failure may reflect that user's permissions, not a removed App installation. An already-enabled `/setup` run by a verified repository administrator may restore a binding marked `recovery_required` or update its stale installation ID while preserving known CMS origins. The self-service enrollment and App setup flows can also recover the same immutable repository-ID binding after fresh installation and repository verification. This supports repository transfers, App repository-selection changes, and recovery when the old CMS origin is no longer available.
-
-## Access Policy
-
-`ACCESS_POLICY=github_login_whitelist` is the default. `GITHUB_LOGIN_WHITELIST` is a deployer-controlled case-insensitive list; an empty list denies all users. For third-party deployments, this is the only supported policy mode. Do not set `ACCESS_POLICY=public` on a third-party worker.
-
-`ACCESS_POLICY=public` exists only for the comic_git-operated shared service, where self-service enrollment is part of the product. It still requires a verified repository/origin binding and does not let arbitrary browser origins receive tokens.
-
-Policy is evaluated during enrollment, normal authorization, and refresh. Removing a login prevents new enrollment and subsequent token refresh, but cannot instantly revoke a previously issued GitHub token; expiring user tokens keep that remaining exposure bounded.
-
-## GitHub App and Data Handling
-
-The App requests repository contents read/write and pull-request read/write permissions. Owners select repositories at installation. The worker holds only the App client ID/client secret needed for the user authorization flow; it does not hold an App private key or create installation tokens in the MVP.
-
-The worker does not persist access tokens, refresh tokens, authorization codes, cookies, state values, raw headers, or comic content server-side. The temporary encrypted setup cookie is the only worker-held credential that survives a request; it never contains a refresh token and is never logged. Logs contain safe request metadata and failure categories only.
+`ACCESS_POLICY=public` is for the comic_git-operated shared service. Independently hosted workers must use `github_login_whitelist`. Both modes still require GitHub repository access and a matching default-branch policy before releasing tokens.

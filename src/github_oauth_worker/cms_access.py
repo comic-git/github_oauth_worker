@@ -1,4 +1,4 @@
-"""Parse a repository's default-branch CMS access policy without granting access yet."""
+"""Parse and verify a repository's default-branch CMS access policy."""
 
 import tomllib
 from dataclasses import dataclass

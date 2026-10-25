@@ -38,14 +38,8 @@ if pulumi.get_stack() != environment:
     raise pulumi.RunError("The Pulumi stack name must match the configured environment.")
 
 project_id = gcp_config.require("project")
-database_id = config.require("firestoreDatabaseId")
 cms_minimum_engine_version = config.require("cmsMinimumEngineVersion")
 cms_allowed_engine_branches = config.require("cmsAllowedEngineBranches")
-expected_database_id = "test" if environment == "test" else "(default)"
-if database_id != expected_database_id:
-    raise pulumi.RunError(
-        f"The {environment} stack must use Firestore database {expected_database_id!r}."
-    )
 
 service_mode = config.get("serviceMode") or "bootstrap"
 if service_mode not in {"bootstrap", "ready"}:
@@ -78,9 +72,6 @@ environment_variables = [
     gcp.cloudrunv2.ServiceTemplateContainerEnvArgs(name="SERVICE_MODE", value=service_mode),
     gcp.cloudrunv2.ServiceTemplateContainerEnvArgs(name="ENVIRONMENT", value=environment),
     gcp.cloudrunv2.ServiceTemplateContainerEnvArgs(name="GCP_PROJECT_ID", value=project_id),
-    gcp.cloudrunv2.ServiceTemplateContainerEnvArgs(
-        name="FIRESTORE_DATABASE_ID", value=database_id
-    ),
     gcp.cloudrunv2.ServiceTemplateContainerEnvArgs(
         name="ACCESS_POLICY", value=config.get("accessPolicy") or "github_login_whitelist"
     ),

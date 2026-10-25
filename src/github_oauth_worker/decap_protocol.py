@@ -5,8 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from github_oauth_worker.bindings import canonicalize_origin
 from github_oauth_worker.html_templates import render_template
+from github_oauth_worker.origin import canonicalize_origin
 
 
 class DecapTokenPayload(BaseModel):
@@ -36,28 +36,6 @@ class DecapTokenPayload(BaseModel):
 def render_handshake_page(handshake_endpoint: str = "/auth/handshake") -> str:
     """Render a non-secret page that obtains the opener origin from Decap's reply event."""
     return render_template("decap_handshake.tpl", endpoint=handshake_endpoint)
-
-
-def render_setup_handshake_page(installation_id: int) -> str:
-    """Render a non-secret App-setup handoff that captures the CMS opener origin."""
-    return render_template("setup_handshake.tpl", installation_id=installation_id)
-
-
-def render_origin_migration_handshake_page(target_origin: str) -> str:
-    """Capture an active source origin before asking GitHub to authorize one target migration."""
-    return _render_management_handshake_page(
-        endpoint="/origins/migrate/handshake",
-        title="Start origin migration",
-        target_origin=canonicalize_origin(target_origin),
-    )
-
-
-def render_origin_completion_handshake_page() -> str:
-    """Capture the destination opener origin before attempting exact pending-origin activation."""
-    return _render_management_handshake_page(
-        endpoint="/origins/complete/handshake",
-        title="Complete origin migration",
-    )
 
 
 def render_management_result_page(
@@ -101,19 +79,4 @@ def _render_callback_page(origin: str, outcome: str, payload: dict[str, Any]) ->
         "decap_callback.tpl",
         target_origin=canonical_origin,
         message=message,
-    )
-
-
-def _render_management_handshake_page(
-    *,
-    endpoint: str,
-    title: str,
-    target_origin: str | None = None,
-) -> str:
-    """Generate the shared non-secret opener handshake used only by origin-management routes."""
-    return render_template(
-        "management_handshake.tpl",
-        endpoint=endpoint,
-        title=title,
-        target_origin=target_origin,
     )

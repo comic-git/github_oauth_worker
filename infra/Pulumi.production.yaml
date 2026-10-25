@@ -1,7 +1,6 @@
 config:
   gcp:project: comic-git
   github-oauth-worker-infra:environment: production
-  github-oauth-worker-infra:firestoreDatabaseId: (default)
   github-oauth-worker-infra:cmsMinimumEngineVersion: "1.2"
   github-oauth-worker-infra:cmsAllowedEngineBranches: latest,master
 secretsprovider: gcpkms://projects/comic-git/locations/us-west1/keyRings/github-oauth-worker-pulumi/cryptoKeys/github-oauth-worker-pulumi-secrets

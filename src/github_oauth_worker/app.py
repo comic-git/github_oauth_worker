@@ -6,26 +6,20 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlencode
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
-from github_oauth_worker.bindings import (
-    BindingStatus,
-    BindingStore,
-    FirestoreBindingStore,
-    RepositoryBinding,
-    canonicalize_origin,
-)
 from github_oauth_worker.cms_access import (
     CMS_ACCESS_POLICY_PATH,
     CmsAccessPolicyChange,
+    CmsAccessPolicyError,
     CmsAccessPolicyPlan,
     CmsAccessPolicyPlanError,
     load_cms_access_policy,
+    parse_cms_access_policy,
     plan_cms_access_policy,
 )
 from github_oauth_worker.cms_access_delivery import (
@@ -58,12 +52,9 @@ from github_oauth_worker.decap_protocol import (
     render_error_callback_page,
     render_handshake_page,
     render_management_result_page,
-    render_origin_completion_handshake_page,
-    render_origin_migration_handshake_page,
     render_success_callback_page,
 )
 from github_oauth_worker.engine_resolution import EngineSelectorError, EngineSelectorPolicy
-from github_oauth_worker.enrollment import render_enrollment_confirmation_page
 from github_oauth_worker.errors import WorkerError
 from github_oauth_worker.github_client import (
     GitHubAccessVerificationError,
@@ -76,6 +67,7 @@ from github_oauth_worker.github_client import (
     GitHubTreeChange,
 )
 from github_oauth_worker.logging import configure_event_logger, log_event
+from github_oauth_worker.origin import canonicalize_origin
 from github_oauth_worker.policy import AccessOperation, build_access_policy
 from github_oauth_worker.setup_session import (
     InvalidSetupSessionError,
@@ -128,24 +120,6 @@ class CmsSetupCancelledError(WorkerError):
     public_message = "GitHub authorization was not completed. Start CMS setup again when ready."
 
 
-class EnrollmentSelectionRequest(BaseModel):
-    """The signed enrollment state and selected verified repository from the confirmation form."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    state: str
-    selection: str
-
-
-class SetupHandshakeRequest(BaseModel):
-    """An untrusted App setup installation ID paired with the browser-captured CMS origin."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    origin: str
-    installation_id: int
-
-
 class CmsSetupSelectionRequest(BaseModel):
     """A signed direct-setup state and repository chosen from its verified installation list."""
 
@@ -190,15 +164,6 @@ class CmsSetupAccessReviewRequest(BaseModel):
     approved_origins: str = Field(min_length=1, max_length=4096)
 
 
-class OriginMigrationHandshakeRequest(BaseModel):
-    """A current browser origin and desired destination captured by the migration popup."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    origin: str
-    target_origin: str
-
-
 async def _validated_form[FormModel: BaseModel](
     request: Request, model: type[FormModel]
 ) -> FormModel:
@@ -223,7 +188,6 @@ _CMS_ENABLEMENT_FLOWS = frozenset(
 
 def create_app(
     settings: WorkerSettings | None = None,
-    binding_store: BindingStore | None = None,
     github_client: GitHubAppClient | None = None,
 ) -> FastAPI:
     """Create the worker and compose ready-mode dependencies only after settings validation."""
@@ -331,19 +295,42 @@ def create_app(
             app.state.state_manager.attach_correlation_cookie(response, issued_state)
             return response
 
-        app.state.binding_store = binding_store or FirestoreBindingStore.from_settings(
-            worker_settings
-        )
+        async def authorize_cms_origin(
+            user_access_token: SecretStr,
+            repository: GitHubRepository,
+            origin: str,
+        ) -> None:
+            """Read live default-branch approval immediately before releasing a token."""
+            content = await app.state.github_client.get_default_branch_cms_access_policy(
+                user_access_token, repository
+            )
+            if content is None:
+                raise CmsAccessPolicyError
+            policy = parse_cms_access_policy(
+                content,
+                repository_id=repository.id,
+                worker_origin=str(worker_settings.public_base_url).rstrip("/"),
+            )
+            if not policy.authorizes_origin(origin):
+                raise CmsAccessPolicyError
+
         app.state.github_client = github_client or GitHubAppClient.from_settings(worker_settings)
         app.state.state_manager = OAuthStateManager.from_settings(worker_settings)
         app.state.setup_sessions = SetupSessionManager.from_settings(worker_settings)
 
     @app.exception_handler(WorkerError)
-    async def handle_worker_error(_: Request, error: WorkerError) -> JSONResponse:
+    async def handle_worker_error(request: Request, error: WorkerError) -> JSONResponse:
         """Return only the deliberate public error text for expected worker failures."""
+        headers = None
+        if re.fullmatch(r"/auth/[1-9][0-9]*/refresh", request.url.path):
+            try:
+                headers = _cors_headers(_require_bound_origin(request))
+            except WorkerError:
+                pass
         return JSONResponse(
             status_code=error.status_code,
             content={"error": error.public_message},
+            headers=headers,
         )
 
     @app.get("/health")
@@ -353,10 +340,12 @@ def create_app(
 
     if worker_settings.service_mode.value == "ready":
 
-        @app.get("/auth")
-        def auth() -> HTMLResponse:
-            """Open a non-secret Decap handshake page before the browser knows its exact origin."""
-            return HTMLResponse(render_handshake_page())
+        @app.get("/auth/{repository_id}")
+        def auth(repository_id: int) -> HTMLResponse:
+            """Capture Decap's actual opener origin for a repository selected by its numeric ID."""
+            if repository_id <= 0:
+                raise WorkerError
+            return HTMLResponse(render_handshake_page(f"/auth/{repository_id}/handshake"))
 
         @app.get("/setup")
         def setup(installation_id: int | None = None) -> HTMLResponse:
@@ -636,8 +625,6 @@ def create_app(
         @app.post("/setup/review-access")
         async def setup_review_access(request: Request) -> Response:
             """Bind the creator's explicit website approvals to the signed CMS review."""
-            if not worker_settings.cms_access_policy_setup_enabled:
-                raise WorkerError
             selection = await _validated_form(request, CmsSetupAccessReviewRequest)
             oauth_state = app.state.state_manager.consume_from_cookies(
                 selection.state, request.cookies
@@ -686,80 +673,18 @@ def create_app(
                 return response
             return redirect_to_github(issued_state, oauth_state.repository_id)
 
-        @app.post("/setup/handshake")
-        async def setup_handshake(request: Request) -> RedirectResponse:
-            """Require fresh GitHub user authorization before trusting a setup installation ID."""
-            handshake = await _validated_form(request, SetupHandshakeRequest)
-            issued_state = app.state.state_manager.issue_setup_installation(
-                handshake.origin,
-                handshake.installation_id,
-            )
-            return redirect_to_github(issued_state)
-
-        @app.get("/origins/migrate")
-        def origin_migration(target_origin: str) -> HTMLResponse:
-            """Open an existing CMS site's migration popup without trusting its query origin."""
+        @app.post("/auth/{repository_id}/handshake")
+        async def auth_handshake(repository_id: int, request: Request) -> RedirectResponse:
+            """Sign the browser-reported origin and repository selector into OAuth state."""
+            if repository_id <= 0:
+                raise WorkerError
+            handshake = await _validated_form(request, AuthHandshakeRequest)
             try:
-                return HTMLResponse(render_origin_migration_handshake_page(target_origin))
+                origin = canonicalize_origin(handshake.origin)
             except ValueError:
                 raise WorkerError from None
-
-        @app.post("/origins/migrate/handshake")
-        async def origin_migration_handshake(
-            request: Request,
-        ) -> RedirectResponse:
-            """Authorize a migration only after the source origin resolves to an active binding."""
-            handshake = await _validated_form(request, OriginMigrationHandshakeRequest)
-            binding = await app.state.binding_store.get_binding_for_origin(handshake.origin)
-            if binding is None or binding.status is not BindingStatus.ACTIVE:
-                raise WorkerError
-            try:
-                source_origin = canonicalize_origin(handshake.origin)
-                target_origin = canonicalize_origin(handshake.target_origin)
-            except ValueError:
-                raise WorkerError from None
-            issued_state = app.state.state_manager.issue_origin_migration(
-                source_origin,
-                target_origin,
-                binding.repository_id,
-                binding.installation_id,
-            )
-            return redirect_to_github(issued_state, binding.repository_id)
-
-        @app.get("/origins/complete")
-        def complete_origin_migration() -> HTMLResponse:
-            """Open a destination CMS popup that captures its actual origin before completion."""
-            return HTMLResponse(render_origin_completion_handshake_page())
-
-        @app.post("/origins/complete/handshake")
-        async def complete_origin_migration_handshake(
-            request: Request,
-        ) -> HTMLResponse:
-            """Activate only a non-expired pending origin whose exact opener origin matches it."""
-            handshake = await _validated_form(request, AuthHandshakeRequest)
-            await app.state.binding_store.complete_origin_migration(
-                handshake.origin,
-                timedelta(seconds=worker_settings.origin_grace_period_seconds),
-            )
-            return HTMLResponse(render_management_result_page("CMS origin migration is complete."))
-
-        @app.post("/auth/handshake")
-        async def auth_handshake(request: Request) -> RedirectResponse:
-            """Resolve a bound opener origin, then redirect its binding to GitHub authorization."""
-            handshake = await _validated_form(request, AuthHandshakeRequest)
-            binding = await app.state.binding_store.get_binding_for_origin(handshake.origin)
-            if binding is None:
-                issued_state = app.state.state_manager.issue_enrollment(handshake.origin)
-                return redirect_to_github(issued_state)
-            if binding.status is not BindingStatus.ACTIVE:
-                raise WorkerError
-
-            issued_state = app.state.state_manager.issue_decap(
-                handshake.origin,
-                binding.repository_id,
-                binding.installation_id,
-            )
-            return redirect_to_github(issued_state, binding.repository_id)
+            issued_state = app.state.state_manager.issue_decap(origin, repository_id)
+            return redirect_to_github(issued_state, repository_id)
 
         @app.get("/callback")
         async def callback(
@@ -785,37 +710,13 @@ def create_app(
                     return await cms_enablement_branch_callback(oauth_state, code)
                 if oauth_state.flow is OAuthFlow.CMS_ENABLEMENT_CONFIRMATION:
                     return await cms_enablement_confirmation_callback(oauth_state, code)
-                assert oauth_state.origin is not None
-                if oauth_state.flow is OAuthFlow.ENROLLMENT:
-                    return await enrollment_callback(oauth_state.origin, code, state)
-                if oauth_state.flow is OAuthFlow.SETUP:
-                    if oauth_state.repository_id is None:
-                        return await setup_installation_callback(
-                            oauth_state.origin,
-                            oauth_state,
-                            code,
-                            state,
-                        )
-                    return await setup_callback(oauth_state.origin, oauth_state, code)
-                if oauth_state.flow is OAuthFlow.ORIGIN_MIGRATION:
-                    return await origin_migration_callback(oauth_state, code)
                 if oauth_state.flow is not OAuthFlow.DECAP:
                     raise WorkerError
+                assert oauth_state.origin is not None
                 assert oauth_state.repository_id is not None
-                assert oauth_state.installation_id is not None
-                binding = await app.state.binding_store.get_binding_for_origin(oauth_state.origin)
-                if (
-                    binding is None
-                    or binding.status is not BindingStatus.ACTIVE
-                    or binding.repository_id != oauth_state.repository_id
-                    or binding.installation_id != oauth_state.installation_id
-                    or oauth_state.origin not in {record.origin for record in binding.origins}
-                ):
-                    raise WorkerError
-
                 access_token = await app.state.github_client.exchange_authorization_code(
                     code,
-                    binding.repository_id,
+                    oauth_state.repository_id,
                 )
                 github_user = await app.state.github_client.get_authenticated_user(
                     access_token.access_token
@@ -824,16 +725,12 @@ def create_app(
                     github_user.login,
                     AccessOperation.AUTHORIZATION,
                 )
-                repository = await app.state.github_client.verify_bound_repository_access(
+                repository = await app.state.github_client.verify_repository_access(
                     access_token.access_token,
-                    binding.installation_id,
-                    binding.repository_id,
+                    oauth_state.repository_id,
                 )
-                await app.state.binding_store.refresh_repository_metadata(
-                    binding.repository_id,
-                    repository.owner.login,
-                    repository.name,
-                    binding.installation_id,
+                await authorize_cms_origin(
+                    access_token.access_token, repository, oauth_state.origin
                 )
                 return HTMLResponse(
                     render_success_callback_page(
@@ -881,15 +778,6 @@ def create_app(
                         ),
                         status_code=error.status_code,
                     )
-                if oauth_state.flow is OAuthFlow.ORIGIN_MIGRATION:
-                    return HTMLResponse(
-                        render_management_result_page(
-                            error.public_message,
-                            heading="CMS origin migration could not continue",
-                            diagnostic_code=error.diagnostic_code,
-                        ),
-                        status_code=error.status_code,
-                    )
                 return HTMLResponse(
                     render_error_callback_page(oauth_state.origin, error.public_message),
                     status_code=error.status_code,
@@ -912,97 +800,10 @@ def create_app(
                         ),
                         status_code=500,
                     )
-                if oauth_state.flow is OAuthFlow.ORIGIN_MIGRATION:
-                    return HTMLResponse(
-                        render_management_result_page(
-                            WorkerError.public_message,
-                            heading="CMS origin migration could not continue",
-                            diagnostic_code="unexpected_callback_failure",
-                        ),
-                        status_code=500,
-                    )
                 return HTMLResponse(
                     render_error_callback_page(oauth_state.origin, WorkerError.public_message),
                     status_code=500,
                 )
-
-        async def enrollment_callback(
-            origin: str,
-            code: str,
-            state_token: str | None,
-        ) -> HTMLResponse:
-            """Show verified App repository choices after initial policy-gated authorization."""
-            access_token = await app.state.github_client.exchange_authorization_code(code)
-            github_user = await app.state.github_client.get_authenticated_user(
-                access_token.access_token
-            )
-            build_access_policy(worker_settings).require_permitted(
-                github_user.login,
-                AccessOperation.ENROLLMENT,
-            )
-            installations = await app.state.github_client.list_accessible_installations(
-                access_token.access_token
-            )
-            choices = []
-            for installation in installations:
-                repositories = await app.state.github_client.list_repositories_for_installation(
-                    access_token.access_token,
-                    installation.id,
-                )
-                choices.extend((installation.id, repository) for repository in repositories)
-            if not choices or state_token is None:
-                raise WorkerError
-            return HTMLResponse(
-                render_enrollment_confirmation_page(origin, state_token, tuple(choices))
-            )
-
-        async def setup_callback(
-            origin: str,
-            oauth_state: OAuthState,
-            code: str,
-        ) -> HTMLResponse:
-            """Use fresh authorization to verify the selected App repository before binding it."""
-            assert oauth_state.repository_id is not None
-            assert oauth_state.installation_id is not None
-            access_token = await app.state.github_client.exchange_authorization_code(
-                code,
-                oauth_state.repository_id,
-            )
-            github_user = await app.state.github_client.get_authenticated_user(
-                access_token.access_token
-            )
-            build_access_policy(worker_settings).require_permitted(
-                github_user.login,
-                AccessOperation.ENROLLMENT,
-            )
-            repository = await app.state.github_client.verify_bound_repository_access(
-                access_token.access_token,
-                oauth_state.installation_id,
-                oauth_state.repository_id,
-            )
-            recovered_binding = RepositoryBinding.create(
-                repository_id=repository.id,
-                repository_owner=repository.owner.login,
-                repository_name=repository.name,
-                installation_id=oauth_state.installation_id,
-                origin=origin,
-            )
-            existing_binding = await app.state.binding_store.get_binding(repository.id)
-            if existing_binding is None:
-                await app.state.binding_store.create_binding(recovered_binding)
-            else:
-                await app.state.binding_store.recover_binding(recovered_binding)
-            return HTMLResponse(
-                render_success_callback_page(
-                    origin,
-                    DecapTokenPayload(
-                        access_token=access_token.access_token,
-                        token_type=access_token.token_type,
-                        refresh_token=access_token.refresh_token,
-                        expires_in=access_token.expires_in,
-                    ),
-                )
-            )
 
         async def cms_enablement_installation_callback(
             oauth_state: OAuthState,
@@ -1415,15 +1216,9 @@ def create_app(
             await app.state.github_client.require_repository_administrator(
                 access_token.access_token, repository, github_user.login
             )
-            if (
-                worker_settings.cms_access_policy_setup_enabled
-                and repository.default_branch is None
-            ):
+            if repository.default_branch is None:
                 raise CmsAccessPolicyPlanError
-            if (
-                worker_settings.cms_access_policy_setup_enabled
-                and oauth_state.approved_origins is None
-            ):
+            if oauth_state.approved_origins is None:
                 existing = await app.state.github_client.get_default_branch_cms_access_policy(
                     access_token.access_token, repository
                 )
@@ -1465,39 +1260,21 @@ def create_app(
             )
             policy_plan = None
             default_commit_sha = None
-            if worker_settings.cms_access_policy_setup_enabled:
-                assert oauth_state.approved_origins is not None
-                policy_plan, default_commit_sha = await build_cms_access_review(
-                    repository,
-                    access_token.access_token,
-                    oauth_state.target_branch,
-                    oauth_state.approved_origins,
-                )
-                if policy_plan.default_branch == preview.target_branch:
-                    if default_commit_sha != preview.base_commit_sha:
-                        raise CmsMigrationReviewChangedError
-                    if (
-                        policy_plan.change is not CmsAccessPolicyChange.UNCHANGED
-                        and not preview.already_enabled
-                    ):
-                        preview = include_cms_access_policy(preview, policy_plan)
-            binding_repaired = False
-            if preview.already_enabled:
-                existing_binding = await app.state.binding_store.get_binding(repository.id)
-                binding_repaired = existing_binding is not None and (
-                    existing_binding.status is not BindingStatus.ACTIVE
-                    or existing_binding.installation_id != oauth_state.installation_id
-                )
-                if binding_repaired:
-                    await app.state.binding_store.recover_binding(
-                        RepositoryBinding.create(
-                            repository_id=repository.id,
-                            repository_owner=repository.owner.login,
-                            repository_name=repository.name,
-                            installation_id=oauth_state.installation_id,
-                            origin=existing_binding.origins[0].origin,
-                        )
-                    )
+            assert oauth_state.approved_origins is not None
+            policy_plan, default_commit_sha = await build_cms_access_review(
+                repository,
+                access_token.access_token,
+                oauth_state.target_branch,
+                oauth_state.approved_origins,
+            )
+            if policy_plan.default_branch == preview.target_branch:
+                if default_commit_sha != preview.base_commit_sha:
+                    raise CmsMigrationReviewChangedError
+                if (
+                    policy_plan.change is not CmsAccessPolicyChange.UNCHANGED
+                    and not preview.already_enabled
+                ):
+                    preview = include_cms_access_policy(preview, policy_plan)
             if preview.already_enabled and (
                 policy_plan is None or policy_plan.change is CmsAccessPolicyChange.UNCHANGED
             ):
@@ -1507,13 +1284,11 @@ def create_app(
                     repository_id=repository.id,
                     target_branch=preview.target_branch,
                     engine_commit_sha=preview.engine_commit_sha,
-                    binding_repaired=binding_repaired,
                 )
                 response = HTMLResponse(
                     render_management_result_page(
                         f"CMS is already enabled for {repository.owner.login}/{repository.name} "
-                        f"on branch {preview.target_branch}. No migration pull request is needed."
-                        + (" The CMS connection was refreshed." if binding_repaired else ""),
+                        f"on branch {preview.target_branch}. No migration pull request is needed.",
                         heading="comic_git CMS is already enabled",
                     )
                 )
@@ -1584,10 +1359,7 @@ def create_app(
                 and not changes
                 and _migration_body_has_engine_sha(current.body, preview.engine_commit_sha)
                 and not superseded
-                and (
-                    policy_plan is None
-                    or policy_plan.change is CmsAccessPolicyChange.UNCHANGED
-                )
+                and (policy_plan is None or policy_plan.change is CmsAccessPolicyChange.UNCHANGED)
             )
             confirmation = app.state.state_manager.issue_cms_enablement_confirmation(
                 repository.id,
@@ -1663,32 +1435,31 @@ def create_app(
             )
             policy_plan = None
             policy_result = None
-            if worker_settings.cms_access_policy_setup_enabled:
-                if (
-                    oauth_state.approved_origins is None
-                    or oauth_state.default_branch_commit_sha is None
-                    or oauth_state.reviewed_policy_digest is None
-                ):
+            if (
+                oauth_state.approved_origins is None
+                or oauth_state.default_branch_commit_sha is None
+                or oauth_state.reviewed_policy_digest is None
+            ):
+                raise CmsMigrationReviewChangedError
+            policy_plan, default_commit_sha = await build_cms_access_review(
+                repository,
+                access_token.access_token,
+                oauth_state.target_branch,
+                oauth_state.approved_origins,
+            )
+            if (
+                default_commit_sha != oauth_state.default_branch_commit_sha
+                or _policy_plan_digest(policy_plan) != oauth_state.reviewed_policy_digest
+            ):
+                raise CmsMigrationReviewChangedError
+            if policy_plan.default_branch == preview.target_branch:
+                if default_commit_sha != preview.base_commit_sha:
                     raise CmsMigrationReviewChangedError
-                policy_plan, default_commit_sha = await build_cms_access_review(
-                    repository,
-                    access_token.access_token,
-                    oauth_state.target_branch,
-                    oauth_state.approved_origins,
-                )
                 if (
-                    default_commit_sha != oauth_state.default_branch_commit_sha
-                    or _policy_plan_digest(policy_plan) != oauth_state.reviewed_policy_digest
+                    policy_plan.change is not CmsAccessPolicyChange.UNCHANGED
+                    and not preview.already_enabled
                 ):
-                    raise CmsMigrationReviewChangedError
-                if policy_plan.default_branch == preview.target_branch:
-                    if default_commit_sha != preview.base_commit_sha:
-                        raise CmsMigrationReviewChangedError
-                    if (
-                        policy_plan.change is not CmsAccessPolicyChange.UNCHANGED
-                        and not preview.already_enabled
-                    ):
-                        preview = include_cms_access_policy(preview, policy_plan)
+                    preview = include_cms_access_policy(preview, policy_plan)
             if preview.already_enabled and (
                 policy_plan is None or policy_plan.change is CmsAccessPolicyChange.UNCHANGED
             ):
@@ -1890,137 +1661,25 @@ def create_app(
                 )
             )
 
-        async def origin_migration_callback(
-            oauth_state: OAuthState,
-            code: str,
-        ) -> HTMLResponse:
-            """Create a pending destination only after fresh owner policy and App access checks."""
-            assert oauth_state.origin is not None
-            assert oauth_state.target_origin is not None
-            assert oauth_state.repository_id is not None
-            assert oauth_state.installation_id is not None
-            access_token = await app.state.github_client.exchange_authorization_code(
-                code,
-                oauth_state.repository_id,
-            )
-            github_user = await app.state.github_client.get_authenticated_user(
-                access_token.access_token
-            )
-            build_access_policy(worker_settings).require_permitted(
-                github_user.login,
-                AccessOperation.AUTHORIZATION,
-            )
-            repository = await app.state.github_client.verify_bound_repository_access(
-                access_token.access_token,
-                oauth_state.installation_id,
-                oauth_state.repository_id,
-            )
-            await app.state.binding_store.refresh_repository_metadata(
-                oauth_state.repository_id,
-                repository.owner.login,
-                repository.name,
-                oauth_state.installation_id,
-            )
-            await app.state.binding_store.begin_origin_migration(
-                oauth_state.repository_id,
-                oauth_state.origin,
-                oauth_state.target_origin,
-                datetime.now(UTC) + timedelta(seconds=worker_settings.oauth_state_ttl_seconds),
-            )
-            return HTMLResponse(
-                render_management_result_page(
-                    "CMS origin migration is ready to complete at the destination site."
-                )
-            )
-
-        async def setup_installation_callback(
-            origin: str,
-            oauth_state: OAuthState,
-            code: str,
-            state_token: str | None,
-        ) -> HTMLResponse:
-            """Prove the setup installation is user-visible before offering its repositories."""
-            assert oauth_state.installation_id is not None
-            access_token = await app.state.github_client.exchange_authorization_code(code)
-            github_user = await app.state.github_client.get_authenticated_user(
-                access_token.access_token
-            )
-            build_access_policy(worker_settings).require_permitted(
-                github_user.login,
-                AccessOperation.ENROLLMENT,
-            )
-            installations = await app.state.github_client.list_accessible_installations(
-                access_token.access_token
-            )
-            if oauth_state.installation_id not in {
-                installation.id for installation in installations
-            }:
+        @app.options("/auth/{repository_id}/refresh")
+        async def auth_refresh_options(repository_id: int, request: Request) -> Response:
+            """Allow valid browser preflight; the POST performs live authorization."""
+            if repository_id <= 0:
                 raise WorkerError
-            repositories = await app.state.github_client.list_repositories_for_installation(
-                access_token.access_token,
-                oauth_state.installation_id,
-            )
-            choices = tuple(
-                (oauth_state.installation_id, repository) for repository in repositories
-            )
-            if not choices or state_token is None:
-                raise WorkerError
-            return HTMLResponse(render_enrollment_confirmation_page(origin, state_token, choices))
-
-        @app.post("/enroll/select")
-        async def enroll_select(request: Request) -> RedirectResponse:
-            """Require fresh authorization after explicit repository selection confirmation."""
-            form_data = parse_qs((await request.body()).decode("utf-8"))
-            try:
-                selection = EnrollmentSelectionRequest.model_validate(
-                    {name: values[0] for name, values in form_data.items() if values}
-                )
-                oauth_state = app.state.state_manager.consume_from_cookies(
-                    selection.state,
-                    request.cookies,
-                )
-                if oauth_state.flow not in (OAuthFlow.ENROLLMENT, OAuthFlow.SETUP):
-                    raise ValueError("Selection state must come from enrollment or setup.")
-                installation_id_text, repository_id_text = selection.selection.split(
-                    ":",
-                    maxsplit=1,
-                )
-                installation_id = int(installation_id_text)
-                if (
-                    oauth_state.flow is OAuthFlow.SETUP
-                    and oauth_state.installation_id != installation_id
-                ):
-                    raise ValueError("The selected installation does not match setup state.")
-                issued_state = app.state.state_manager.issue_setup(
-                    oauth_state.origin or "",
-                    int(repository_id_text),
-                    installation_id,
-                )
-            except UnicodeDecodeError, ValidationError, ValueError:
-                raise WorkerError from None
-            return redirect_to_github(issued_state, int(repository_id_text))
-
-        @app.options("/auth/refresh")
-        async def auth_refresh_options(request: Request) -> Response:
-            """Grant browser CORS preflight only to a currently bound exact CMS origin."""
             origin = _require_bound_origin(request)
-            binding = await app.state.binding_store.get_binding_for_origin(origin)
-            if binding is None or binding.status is not BindingStatus.ACTIVE:
-                raise WorkerError
             return Response(
                 status_code=204,
                 headers=_cors_headers(origin),
             )
 
-        @app.post("/auth/refresh")
-        async def auth_refresh(request: Request, provider: str | None = None) -> JSONResponse:
+        @app.post("/auth/{repository_id}/refresh")
+        async def auth_refresh(
+            repository_id: int, request: Request, provider: str | None = None
+        ) -> JSONResponse:
             """Refresh only after policy and repository verification for the request origin."""
-            if provider != "github":
+            if provider != "github" or repository_id <= 0:
                 raise WorkerError
             origin = _require_bound_origin(request)
-            binding = await app.state.binding_store.get_binding_for_origin(origin)
-            if binding is None or binding.status is not BindingStatus.ACTIVE:
-                raise WorkerError
 
             try:
                 refresh_request = RefreshTokenRequest.model_validate(
@@ -2040,17 +1699,11 @@ def create_app(
                     github_user.login,
                     AccessOperation.REFRESH,
                 )
-                repository = await app.state.github_client.verify_bound_repository_access(
+                repository = await app.state.github_client.verify_repository_access(
                     access_token.access_token,
-                    binding.installation_id,
-                    binding.repository_id,
+                    repository_id,
                 )
-                await app.state.binding_store.refresh_repository_metadata(
-                    binding.repository_id,
-                    repository.owner.login,
-                    repository.name,
-                    binding.installation_id,
-                )
+                await authorize_cms_origin(access_token.access_token, repository, origin)
                 payload = DecapTokenPayload(
                     access_token=access_token.access_token,
                     token_type=access_token.token_type,
@@ -2068,7 +1721,7 @@ app = create_app()
 
 
 def _require_bound_origin(request: Request) -> str:
-    """Validate the browser Origin header before it is used as a binding lookup key."""
+    """Validate the actual browser Origin header used for CMS token refresh."""
     origin = request.headers.get("origin")
     if origin is None:
         raise WorkerError
@@ -2162,6 +1815,6 @@ def _cms_enablement_input(
         "repository": f"{owner}/{name}",
         "branch": target_branch,
         "backend_base_url": backend_base_url,
-        "backend_auth_endpoint": "auth",
+        "backend_auth_endpoint": f"auth/{repository.id}",
         "editorial_workflow": False,
     }

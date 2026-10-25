@@ -61,7 +61,7 @@ verification step is mandatory even when GitHub initiated the redirect.
 
 App visibility does not replace the worker access policy. Even a private App needs the whitelist for
 an independent deployment, and even the shared App still requires a verified repository/origin
-binding before it returns a token.
+default-branch access policy before it returns a token.
 
 ## Secret Handling
 

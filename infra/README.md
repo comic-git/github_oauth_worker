@@ -103,11 +103,12 @@ belong in GitHub Environment secrets.
 
 ## Bootstrap Resources
 
-The owner-run bootstrap program creates the required APIs, protected KMS key, separate test and
-production Firestore databases, Artifact Registry repositories, Secret Manager containers, and
+The owner-run bootstrap program creates the required APIs, protected KMS key, Artifact Registry repositories, Secret Manager containers, and
 runtime/CI service accounts. It also creates separate GitHub Actions Workload Identity Federation
 pools and providers. The test provider permits this repository on any branch; the production
 provider additionally requires `master`.
+
+The worker and bootstrap program do not manage a database. Keep the shared Firestore API enabled in this GCP project; other services may rely on it.
 
 Each CI identity can deploy only its matching Cloud Run service, write only its matching Artifact
 Registry repository and Secret Manager versions, access only the shared Pulumi state bucket, and

@@ -78,9 +78,7 @@ def test_verify_bound_access_requires_both_installation_and_repository() -> None
                     200,
                     json={
                         "total_count": 1,
-                        "repositories": [
-                            {"id": 123, "name": "comic", "owner": {"login": "owner"}}
-                        ],
+                        "repositories": [{"id": 123, "name": "comic", "owner": {"login": "owner"}}],
                     },
                 )
             if request.url.path == "/repositories/123":
@@ -171,6 +169,38 @@ def test_list_repository_branches_uses_bounded_pagination() -> None:
             "cms",
         ]
         assert [request.url.params["page"] for request in requests] == ["1", "2"]
+
+    asyncio.run(scenario())
+
+
+def test_verify_repository_access_requires_an_accessible_app_installation() -> None:
+    async def scenario() -> None:
+        requested_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_paths.append(request.url.path)
+            if request.url.path == "/user/installations":
+                return httpx.Response(200, json={"installations": [{"id": 44}]})
+            if request.url.path == "/user/installations/44/repositories":
+                return httpx.Response(
+                    200,
+                    json={
+                        "total_count": 1,
+                        "repositories": [{"id": 123, "name": "comic", "owner": {"login": "owner"}}],
+                    },
+                )
+            if request.url.path == "/repositories/123":
+                return httpx.Response(
+                    200,
+                    json={"id": 123, "name": "comic", "owner": {"login": "owner"}},
+                )
+            raise AssertionError(f"Unexpected URL: {request.url}")
+
+        client = _client(handler)
+        assert (await client.verify_repository_access(SecretStr("token"), 123)).id == 123
+        with pytest.raises(GitHubAccessVerificationError):
+            await client.verify_repository_access(SecretStr("token"), 456)
+        assert "/repositories/456" not in requested_paths
 
     asyncio.run(scenario())
 
@@ -514,9 +544,7 @@ def test_delete_superseded_migration_branch_is_idempotent(status_code: int) -> N
             _repository(),
             "comic-git/cms-enable/123456789abc",
         )
-        assert requests == [
-            "/repos/owner/comic/git/refs/heads/comic-git/cms-enable/123456789abc"
-        ]
+        assert requests == ["/repos/owner/comic/git/refs/heads/comic-git/cms-enable/123456789abc"]
 
     asyncio.run(scenario())
 

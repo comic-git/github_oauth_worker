@@ -380,7 +380,7 @@ class GitHubAppClient:
             ):
                 raise GitHubClientError
             content = base64.decodebytes(file.content.encode("ascii"))
-        except (ValueError, UnicodeEncodeError, binascii.Error, TypeError):
+        except ValueError, UnicodeEncodeError, binascii.Error, TypeError:
             raise GitHubClientError from None
         if len(content) != file.size:
             raise GitHubClientError
@@ -427,6 +427,22 @@ class GitHubAppClient:
         if repository.id != repository_id:
             raise GitHubAccessVerificationError
         return repository
+
+    async def verify_repository_access(
+        self,
+        user_access_token: SecretStr,
+        repository_id: int,
+    ) -> GitHubRepository:
+        """Verify both the user and this App can reach the selected repository."""
+        for installation in await self.list_accessible_installations(user_access_token):
+            repositories = await self.list_repositories_for_installation(
+                user_access_token, installation.id
+            )
+            if repository_id in {repository.id for repository in repositories}:
+                repository = await self.get_repository(user_access_token, repository_id)
+                if repository.id == repository_id:
+                    return repository
+        raise GitHubAccessVerificationError
 
     async def require_repository_administrator(
         self,

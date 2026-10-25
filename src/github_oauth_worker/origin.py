@@ -1,4 +1,4 @@
-"""HTTPS origin validation shared by CMS access and existing binding flows."""
+"""HTTPS origin validation shared by CMS access and setup flows."""
 
 from pydantic import HttpUrl, TypeAdapter, ValidationError
 

@@ -18,7 +18,7 @@ For a deployed test App, use the [numbered CMS setup manual verification checkli
 
 ## Test Structure
 
-The planned layout is:
+The test layout is:
 
 ```text
 tests/unit/          Pure configuration, state, policy, and response-format tests.
@@ -47,11 +47,11 @@ These checks use Pulumi mocks and do not authenticate to, inspect, or create GCP
 
 ## Required Initial Coverage
 
-- Reject unsupported providers, invalid `site_id` values, missing state, expired state, and state/cookie mismatches.
+- Reject unsupported providers, invalid repository IDs, missing state, expired state, and state/cookie mismatches.
 - Verify authorization-code and refresh exchanges use bounded HTTP requests and that sensitive values never appear in errors or logs.
-- Verify whitelist matching is case-insensitive, empty whitelists deny access, and policy runs at enrollment, authorization, and token refresh.
-- Verify Firestore binding lookup, setup installation-ID verification, repository-access verification, origin migration, and lost-origin recovery with simulated boundaries.
-- Verify success and failure callback pages emit Decap-compatible `postMessage` payloads to an exact bound origin, never a wildcard target.
+- Verify whitelist matching is case-insensitive, empty whitelists deny access, and policy runs at setup, authorization, and token refresh.
+- Verify setup installation-ID access, user repository access, current default-branch policy, exact worker and origin matching, and revocation at refresh with simulated GitHub boundaries.
+- Verify success and failure callback pages emit Decap-compatible `postMessage` payloads to the verified origin, never a wildcard target.
 - Verify the health endpoint exposes no secret configuration.
 
 ## Failing Tests

@@ -7,7 +7,7 @@ This repository will provide the OAuth bridge for the Decap CMS integration in c
 
 ## Quick Start
 
-The local bootstrap service exposes a health endpoint only. Configuration, signed state, and access-policy foundations are implemented, but OAuth routes remain unavailable until the binding and GitHub-client tasks are complete.
+The worker serves GitHub App OAuth for Decap and guides repository owners through CMS setup. Website authorization is defined by `.comic_git/cms_access.toml` on the repository's current default branch; the worker has no runtime database dependency. Start with the [infrastructure setup guide](infra/README.md) when deploying a worker.
 
 ```powershell
 py -3.14 -m venv .venv

@@ -1,53 +1,25 @@
-<!-- ai-agent-toolkit:managed version="1.1.0" -->
-<!-- Audience: AI agents and human developers. -->
-
 # Architecture
 
-## Overview
+github_oauth_worker is a self-hostable GitHub App OAuth bridge for comic_git Decap CMS sites. It returns a short-lived GitHub user token only when the user can access the selected repository and that repository's default-branch policy authorizes the requesting website origin.
 
-github_oauth_worker is a self-hostable OAuth bridge for comic_git Decap CMS sites. It issues GitHub App user tokens only after it verifies a binding between the browser's actual CMS origin and one repository selected during GitHub App installation.
+| Component | Responsibility |
+| --- | --- |
+| FastAPI | Guided CMS setup, Decap OAuth callback and refresh, health endpoint. |
+| GitHub client | OAuth exchange, App installation and repository membership, current policy read, branch and PR writes during setup. |
+| Access policy | Exact HTTPS origin, repository ID, and worker-origin approval from `.comic_git/cms_access.toml` on the current default branch. |
+| Engine migration runner | Versioned TOML migration and narrow CMS settings repair in an isolated workspace. |
+| Pulumi | Separate test and production Cloud Run, GitHub App credentials, identities, and deployment resources. |
 
-The comic_git-operated shared service can accept self-service enrollment for eligible comic_git owners. Independently hosted services default to a GitHub-login whitelist and must not use `public` mode. Both modes use the same binding and repository-verification controls, so `public` policy never means that an arbitrary browser origin can receive an editor token.
+## Token Boundary
 
-## Components
+The published comic sets `backend_auth_endpoint` to `auth/<numeric repository ID>`. The ID routes the request but grants nothing by itself. The popup records the opener's actual origin and signs it into browser-correlated OAuth state. After GitHub authorization, the worker checks the optional login whitelist, the user's App access to that repository, and the live default-branch access policy. Only then does it post credentials to that exact origin. Refresh repeats these checks. Details are in [the worker contract](features/cms-oauth/worker-contract.md).
 
-| Component       | Responsibility                                                                                        |
-|-----------------|-------------------------------------------------------------------------------------------------------|
-| FastAPI service | Implements Decap, enrollment, CMS enablement, origin migration, and health HTTP flows.                |
-| Binding store   | Firestore records verified repository-to-origin bindings and direct origin lookup records.            |
-| Access policy   | Allows or denies a GitHub login at enrollment, authorization, and refresh.                            |
-| GitHub App      | Defines user-token permissions and lets owners select exactly which repositories the service may use. |
-| Cloud Run       | Runs the public stateless service with scale-to-zero.                                                 |
-| Secret Manager  | Holds the GitHub client secret and state-signing secret.                                              |
-| Pulumi          | Provisions GCP resources and their least-privilege bindings.                                          |
+A default-branch policy read is a security boundary: the site cannot select an old branch with stale approval. If a default branch changes, login fails until the policy exists on the new default branch. Two repositories may share a GitHub Pages origin but keep separate policies by ID; sharing an origin still shares browser storage.
 
-## Authorization Flow
+## Setup Boundary
 
-1. Decap opens the worker popup and performs its non-secret handshake.
-2. The worker captures the opener's actual origin from `MessageEvent.origin`, then resolves the direct Firestore binding for that canonical origin.
-3. An unknown origin enters self-service enrollment. An inactive binding produces a safe error. An active binding continues to GitHub authorization.
-4. The worker evaluates policy, exchanges the GitHub code with the binding's repository ID, and independently verifies that the returned user token can access the bound repository.
-5. The callback posts Decap's result only to that exact origin. The worker retains no editor token or refresh token.
-6. Refresh repeats policy and repository-access verification before returning a refreshed token.
+Setup verifies GitHub administrator access, obtains explicit origin approval, and uses the selected engine's migration runner to prepare changes. It proposes a policy PR against the default branch and a CMS migration PR against the selected branch when each is needed. Both changes can share one PR when the branches are the same. GitHub branches and PRs are the source of truth for review state. The short-lived setup session is only for avoiding unnecessary OAuth prompts.
 
-## Enrollment and Migration
+## Deployment Boundary
 
-Enrollment verifies an App installation and user-selected repository before creating a binding. The GitHub setup URL starts CMS enablement after installation and installation updates. Its supplied installation ID is never trusted on its own; the worker authenticates the user and verifies the installation/repository through GitHub before creating a reviewable migration pull request or writing a binding.
-
-Repository IDs, not owner/name strings, are binding identities. Renames only refresh display metadata. A transfer or changed App repository selection causes verification to fail safely and directs the new administrator into recovery enrollment. A custom-domain migration starts at an existing bound origin, requires the new origin's actual popup handshake to complete, and leaves the old origin active for a configured grace period.
-
-## CMS Enablement
-
-The planned first-run setup flow converts a legacy comic_git repository to CMS-ready TOML and creates a pull request for the creator to review and merge. After selecting a repository, the creator chooses an accessible branch; the repository default is preselected. The worker revalidates that branch before preview and confirmation, uses it for all migration reads and writes, and targets the pull request at it. The worker never interprets comic content itself: it invokes a pinned comic_git_engine migration library against a temporary workspace populated from verified GitHub repository data. The worker does not clone or execute repository code. A generated pull request retains legacy files, adds TOML and CMS configuration, and records the exact resolved engine SHA without changing the repository's configured engine version or submodule revision.
-
-## External Boundaries
-
-The endpoint and security contract is in [CMS OAuth worker contract](features/cms-oauth/worker-contract.md). comic_git_engine remains the authority for CMS TOML/content compatibility. The worker only orchestrates a narrow, engine-produced migration plan for an explicitly confirmed setup request; it is not a general GitHub proxy.
-
-## Design Constraints
-
-- The worker must be publicly reachable for browser popups, but only registered exact origins receive callback tokens.
-- Test and production are separate Cloud Run workers, GitHub Apps, service accounts, credentials, and Firestore databases in one GCP project. Database-specific IAM conditions prevent either worker from accessing the other's records.
-- The worker uses the GitHub App client ID and client secret for user authorization. It does not hold an App private key or issue installation access tokens in the MVP.
-- Firestore stores binding metadata, not GitHub credentials or user sessions.
-- The normal authentication hot path is a direct origin-record lookup, not a collection query.
+Test and production have separate Cloud Run services, GitHub Apps, credentials, and runtime identities in one GCP project. The worker stores no repository bindings, user tokens, or migration state in a database. See [infrastructure](infrastructure.md).

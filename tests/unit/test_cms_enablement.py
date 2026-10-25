@@ -162,9 +162,9 @@ def test_extract_official_engine_archive_accepts_one_bounded_regular_file_root(
         {
             "comic_git_engine-cms/cms_migration_contract.json": json.dumps(
                 {
-                    "protocol_version": 1,
+                    "protocol_version": 2,
                     "runner_module": "build.migration.runner",
-                    "required_runtime_packages": ["tomli-w"],
+                    "required_runtime_packages": ["tomli-w", "tomlkit"],
                 }
             ),
             "comic_git_engine-cms/src/build/migration/runner.py": "",
@@ -174,7 +174,7 @@ def test_extract_official_engine_archive_accepts_one_bounded_regular_file_root(
     engine = extract_official_engine_archive(archive, tmp_path)
 
     assert engine.root == tmp_path / "comic_git_engine-cms"
-    assert engine.contract.required_runtime_packages == ("tomli-w",)
+    assert engine.contract.required_runtime_packages == ("tomli-w", "tomlkit")
 
 
 def test_extract_official_engine_archive_rejects_unsafe_paths_and_links(tmp_path: Path) -> None:
@@ -195,7 +195,7 @@ def test_extract_official_engine_archive_rejects_unsupported_runner_dependencies
         {
             "root/cms_migration_contract.json": json.dumps(
                 {
-                    "protocol_version": 1,
+                    "protocol_version": 2,
                     "runner_module": "build.migration.runner",
                     "required_runtime_packages": ["unreviewed-package"],
                 }
@@ -284,7 +284,7 @@ def test_runner_result_allows_only_toml_changes_in_your_content() -> None:
     plan = parse_runner_plan(
         json.dumps(
             {
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "files": [{"path": "your_content/comic_info.toml", "content": "[cms]"}],
             }
         )
@@ -296,7 +296,7 @@ def test_runner_result_allows_only_toml_changes_in_your_content() -> None:
             parse_runner_plan(
                 json.dumps(
                     {
-                        "protocol_version": 1,
+                        "protocol_version": 2,
                         "files": [{"path": invalid_path, "content": "[cms]"}],
                     }
                 )
@@ -423,9 +423,7 @@ def test_target_state_prefers_toml_when_legacy_config_is_retained() -> None:
             )
 
     state = asyncio.run(
-        read_target_repository_state(
-            TargetStateClient(), SecretStr("token"), _repository(), "cms"
-        )
+        read_target_repository_state(TargetStateClient(), SecretStr("token"), _repository(), "cms")
     )
 
     assert state.config_path == "your_content/comic_info.toml"
@@ -434,16 +432,16 @@ def test_target_state_prefers_toml_when_legacy_config_is_retained() -> None:
 
 def test_runner_accepts_only_an_explicit_empty_already_enabled_result() -> None:
     result = parse_runner_plan(
-        json.dumps({"protocol_version": 1, "outcome": "already_enabled", "files": []})
+        json.dumps({"protocol_version": 2, "outcome": "already_enabled", "files": []})
     )
 
     assert result.already_enabled
     assert result.files == ()
     for invalid in (
-        {"protocol_version": 1, "files": []},
-        {"protocol_version": 1, "outcome": "unknown", "files": []},
-        {"protocol_version": 1, "outcome": [], "files": []},
-        {"protocol_version": 1, "outcome": "already_enabled", "files": [{}]},
+        {"protocol_version": 2, "files": []},
+        {"protocol_version": 2, "outcome": "unknown", "files": []},
+        {"protocol_version": 2, "outcome": [], "files": []},
+        {"protocol_version": 2, "outcome": "already_enabled", "files": [{}]},
     ):
         with pytest.raises(CmsEnablementError):
             parse_runner_plan(json.dumps(invalid))
@@ -452,11 +450,11 @@ def test_runner_accepts_only_an_explicit_empty_already_enabled_result() -> None:
 def test_runner_uses_a_scrubbed_environment_and_fixed_module(tmp_path: Path) -> None:
     engine = MaterializedEngine(
         root=tmp_path / "engine",
-        contract=EngineMigrationContract(1, "build.migration.runner", ("tomli-w",)),
+        contract=EngineMigrationContract(2, "build.migration.runner", ("tomli-w", "tomlkit")),
     )
     runner_output = json.dumps(
         {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "files": [{"path": "your_content/comic_info.toml", "content": "[cms]"}],
         }
     )
@@ -479,9 +477,9 @@ def test_runner_uses_a_scrubbed_environment_and_fixed_module(tmp_path: Path) -> 
 def test_runner_failure_keeps_only_structured_safe_diagnostics(tmp_path: Path) -> None:
     engine = MaterializedEngine(
         root=tmp_path / "engine",
-        contract=EngineMigrationContract(1, "build.migration.runner", ("tomli-w",)),
+        contract=EngineMigrationContract(2, "build.migration.runner", ("tomli-w", "tomlkit")),
     )
-    runner_failure = json.dumps({"protocol_version": 1, "failure_code": "internal_error"})
+    runner_failure = json.dumps({"protocol_version": 2, "failure_code": "internal_error"})
 
     with patch(
         "github_oauth_worker.cms_enablement.subprocess.run",
@@ -503,9 +501,9 @@ def test_runner_failure_keeps_only_structured_safe_diagnostics(tmp_path: Path) -
 def test_runner_surfaces_fixed_toml_setup_failure_without_stderr_text(tmp_path: Path) -> None:
     engine = MaterializedEngine(
         root=tmp_path / "engine",
-        contract=EngineMigrationContract(1, "build.migration.runner", ("tomli-w",)),
+        contract=EngineMigrationContract(2, "build.migration.runner", ("tomli-w", "tomlkit")),
     )
-    runner_failure = json.dumps({"protocol_version": 1, "failure_code": "cms_not_ready"})
+    runner_failure = json.dumps({"protocol_version": 2, "failure_code": "cms_not_ready"})
 
     with patch(
         "github_oauth_worker.cms_enablement.subprocess.run",
@@ -521,7 +519,7 @@ def test_runner_surfaces_fixed_toml_setup_failure_without_stderr_text(tmp_path: 
 def test_runner_failure_does_not_expose_unstructured_stderr(tmp_path: Path) -> None:
     engine = MaterializedEngine(
         root=tmp_path / "engine",
-        contract=EngineMigrationContract(1, "build.migration.runner", ("tomli-w",)),
+        contract=EngineMigrationContract(2, "build.migration.runner", ("tomli-w", "tomlkit")),
     )
     raw_stderr = "Traceback: target file contained secret-value"
 

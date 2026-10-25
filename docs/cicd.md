@@ -15,9 +15,9 @@ Production uses the same ordered preview then apply jobs, but production apply i
 
 ## Credentials and Boundaries
 
-Test and production use separate GitHub Apps, Cloud Run services, Firestore databases, runtime service accounts, and Secret Manager secrets. CI test credentials may access only the test environment. Production credentials are available only to the manually dispatched production workflow.
+Test and production use separate GitHub Apps, Cloud Run services, runtime service accounts, and Secret Manager secrets. CI test credentials may access only the test environment. Production credentials are available only to the manually dispatched production workflow.
 
-CI must never print Pulumi secret values, GitHub App credentials, user tokens, or Firestore binding records. Infrastructure jobs require particular review because they can alter public endpoints, identity permissions, or persistent data.
+CI must never print Pulumi secret values, GitHub App credentials, or user tokens. Infrastructure jobs require particular review because they can alter public endpoints, identity permissions, or persistent data.
 
 ## Labels
 

@@ -1,7 +1,6 @@
 config:
   gcp:project: comic-git
   github-oauth-worker-infra:environment: test
-  github-oauth-worker-infra:firestoreDatabaseId: test
   github-oauth-worker-infra:cmsMinimumEngineVersion: "1.2"
   github-oauth-worker-infra:cmsAllowedEngineBranches: latest,master,cms
   github-oauth-worker-infra:serviceMode: ready

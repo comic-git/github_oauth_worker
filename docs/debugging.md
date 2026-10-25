@@ -5,7 +5,7 @@
 
 ## Current State
 
-There is no running service or log configuration until implementation begins. The diagnostics below apply after a Cloud Run deployment exists.
+The diagnostics below apply to a ready-mode Cloud Run deployment.
 
 ## Reading Logs
 
@@ -22,8 +22,8 @@ Logs may contain request IDs, endpoint names, status codes, and safe failure cat
 |-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------|
 | GitHub rejects the callback               | Registered App callback URL differs from the deployed public URL                                                      | Compare the exact scheme, host, and path.                                      |
 | Decap popup does not finish               | Worker URL or callback message format is incorrect                                                                    | Confirm Decap's configured base URL and inspect the popup's browser console.   |
-| User is denied after GitHub authorization | Login policy denied enrollment, no active origin binding exists, or the App is not installed for the bound repository | Check the whitelist, binding status, and App installation.                     |
-| Refresh fails                             | Token expired, refresh token is invalid, policy changed, or the bound repository is no longer selected for the App    | Check the safe failure category and re-authenticate without logging the token. |
+| User is denied after GitHub authorization | Whitelist denial, missing or mismatched default-branch `.comic_git/cms_access.toml`, or missing GitHub repository access | Check the whitelist, current default-branch policy, and App installation. |
+| Refresh fails                             | Token expired, refresh token is invalid, policy changed, or the repository is no longer accessible to the user | Check the safe failure category and re-authenticate without logging the token. |
 
 ## Useful Diagnostics
 

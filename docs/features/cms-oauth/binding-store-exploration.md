@@ -1,5 +1,7 @@
 # Can CMS Login Work Without Firestore?
 
+> Historical design exploration. The implemented contract is described in [Worker contract](worker-contract.md); this document is not operational guidance.
+
 The proposed direction is to keep CMS access approval in the repository, on its default branch. This is a design agreement, not a change to the running worker. The prototype does not change login or remove Firestore.
 
 ## Terms Used Here

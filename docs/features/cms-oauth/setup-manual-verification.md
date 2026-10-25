@@ -101,8 +101,8 @@ Use this checklist against a deployed test worker and test GitHub App. The IDs a
 | Step | Action | Expected result |
 |------|--------|-----------------|
 | 1 | Select a branch whose engine version is older than the worker's CMS minimum. | After branch selection, the worker reports that the engine version is too old, with troubleshooting code `engine_version_too_old`; no PR is created. |
-| 2 | Separately, select a branch already migrated to TOML and enabled for this repository, branch, and worker. It may retain legacy INI files. | Worker: **comic_git CMS is already enabled**, with a message that no migration pull request is needed. No new PR is created. If the existing worker binding has a stale installation ID or requires recovery, setup refreshes it and says the CMS connection was refreshed. |
-| 3 | Select a TOML-backed branch whose CMS is disabled, or whose enabled CMS settings point to another repository, branch, or worker. | Worker shows `cms_toml_not_enabled` or `cms_settings_mismatch`, respectively. Neither state is treated as an already-enabled success. |
+| 2 | Separately, select a branch already migrated to TOML and enabled for this repository, branch, and worker. It may retain legacy INI files. | Worker: **comic_git CMS is already enabled**, with a message that no migration pull request is needed. The setup flow still offers an access-policy pull request if the current default branch does not authorize this website. |
+| 3 | Select a TOML-backed branch whose CMS is disabled, or whose enabled CMS settings point to another repository, branch, or worker. | Worker reviews a narrow repair to worker-owned `[cms]` settings, preserving other TOML content and comments. Confirming the review creates or refreshes the migration pull request. |
 | 4 | Select a TOML-backed branch with matching CMS settings but a page that fails the engine's CMS editing checks. | Worker shows `cms_not_ready` and does not create a PR. The engine build provides the file-level readiness details. |
 
 ## Pull Request Lifecycle

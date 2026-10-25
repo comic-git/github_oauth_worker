@@ -85,7 +85,6 @@ def create_environment(
     pulumi_state_bucket: str,
 ) -> dict[str, pulumi.Input[str]]:
     """Create one isolated runtime, artifact, secret, and CI identity boundary."""
-    database_id = "test" if environment == "test" else "(default)"
     resource_prefix = f"github-oauth-worker-{environment}"
 
     runtime_service_account = gcp.serviceaccount.Account(
@@ -117,33 +116,6 @@ def create_environment(
         bucket=pulumi_state_bucket,
         role="roles/storage.objectAdmin",
         member=ci_service_account.member,
-    )
-
-    database = gcp.firestore.Database(
-        f"{resource_prefix}-database",
-        project=project_id,
-        name=database_id,
-        location_id=REGION,
-        type="FIRESTORE_NATIVE",
-        concurrency_mode="OPTIMISTIC",
-        app_engine_integration_mode="DISABLED",
-        delete_protection_state="DELETE_PROTECTION_ENABLED",
-        deletion_policy="PREVENT",
-        opts=pulumi.ResourceOptions(depends_on=service_dependencies),
-    )
-
-    database_resource_prefix = f"projects/{project_id}/databases/{database_id}"
-    gcp.projects.IAMMember(
-        f"{resource_prefix}-runtime-firestore",
-        project=project_id,
-        role="roles/datastore.user",
-        member=runtime_service_account.member,
-        condition=gcp.projects.IAMMemberConditionArgs(
-            title=f"{resource_prefix}-database-only",
-            description="Restrict this runtime identity to its Firestore database.",
-            expression=f"resource.name.startsWith('{database_resource_prefix}')",
-        ),
-        opts=pulumi.ResourceOptions(depends_on=[database]),
     )
 
     artifact_repository = gcp.artifactregistry.Repository(
@@ -271,7 +243,6 @@ def create_environment(
     return {
         "artifact_repository": artifact_repository.repository_id,
         "ci_service_account": ci_service_account.email,
-        "database": database.name,
         "runtime_service_account": runtime_service_account.email,
         "wif_provider": provider.name,
     }

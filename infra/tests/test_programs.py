@@ -57,7 +57,6 @@ class PulumiProgramTests(unittest.TestCase):
             configuration={
                 "github-oauth-worker-infra:environment": "test",
                 "gcp:project": "comic-git",
-                "github-oauth-worker-infra:firestoreDatabaseId": "test",
                 "github-oauth-worker-infra:cmsMinimumEngineVersion": "1.2",
                 "github-oauth-worker-infra:cmsAllowedEngineBranches": "latest,master,cms",
             },
@@ -83,7 +82,6 @@ class PulumiProgramTests(unittest.TestCase):
             configuration={
                 "github-oauth-worker-infra:environment": "test",
                 "gcp:project": "comic-git",
-                "github-oauth-worker-infra:firestoreDatabaseId": "test",
                 "github-oauth-worker-infra:cmsMinimumEngineVersion": "1.2",
                 "github-oauth-worker-infra:cmsAllowedEngineBranches": "latest,master,cms",
                 "github-oauth-worker-infra:serviceMode": "ready",
@@ -105,6 +103,7 @@ class PulumiProgramTests(unittest.TestCase):
         service_inputs = mocks.resource_inputs["github-oauth-worker-test"]
         self.assertIn("GITHUB_APP_SLUG", str(service_inputs))
         self.assertIn("test-comic-git", str(service_inputs))
+        self.assertNotIn("FIRESTORE_DATABASE_ID", str(service_inputs))
 
     def test_bootstrap_program_builds_environment_boundaries(self) -> None:
         mocks = self._run_program(
@@ -116,7 +115,9 @@ class PulumiProgramTests(unittest.TestCase):
                 "github-oauth-worker-bootstrap:pulumiStateBucket": "pulumi-state-test",
             },
         )
-        self.assertIn("gcp:firestore/database:Database", mocks.resource_types)
+        self.assertNotIn("gcp:firestore/database:Database", mocks.resource_types)
+        self.assertNotIn("github-oauth-worker-test-runtime-firestore", mocks.resource_inputs)
+        self.assertNotIn("github-oauth-worker-production-runtime-firestore", mocks.resource_inputs)
         self.assertIn("gcp:kms/keyRing:KeyRing", mocks.resource_types)
         self.assertIn("gcp:kms/cryptoKey:CryptoKey", mocks.resource_types)
         self.assertEqual(
